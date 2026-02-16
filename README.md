@@ -32,6 +32,10 @@ With custom topics:
 ros2 launch apriltag_pose apriltag_pose.launch.py image_topic:=/my_camera/color/image_raw cloud_topic:=/my_camera/depth/color/points
 ```
 
+```
+ros2 launch apriltag_pose apriltag_pose.launch.py image_topic:=/tiago_head_camera_down/color/image_raw cloud_topic:=/tiago_head_camera_down/depth_registered/points display:=true verbose:=true frame_id:=tiago_head_camera_down_color_optical_frame
+```
+
 ## ROS 2 Parameters
 
 | Parameter | Type | Default | Description |

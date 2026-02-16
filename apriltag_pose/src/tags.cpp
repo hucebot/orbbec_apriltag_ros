@@ -321,6 +321,8 @@ private:
             Eigen::Vector2i uv3(det->p[2][0], det->p[2][1]);
             Eigen::Vector2i uv4(det->p[3][0], det->p[3][1]);
 
+            // std::cout << "Got tag " << det->id << " with uv0: " << uv0.x() << ", " << uv0.y() << std::endl;
+
             //Bounds check
             if (
                 uv0.x() < 0 || uv0.x() >= width ||

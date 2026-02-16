@@ -24,7 +24,7 @@ if [ $IsRunning -eq "0" ]; then
         --device /dev/dri \
         --net host \
         --name apriltag_pose \
-        -ti inria_docker:orbbec \
+        -ti inria_docker:apriltag_pose \
         bash -c "source /ros2_ws/install/setup.bash && ros2 launch apriltag_pose apriltag_pose.launch.py display:=${DISPLAY_ARG} verbose:=${VERBOSE_ARG}"
 else
     echo "Docker image is already running. Aborting.";

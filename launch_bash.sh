@@ -3,22 +3,45 @@ IsRunning=`docker ps -f name=apriltag_pose | grep -c "apriltag_pose"`;
 if [ $IsRunning -eq "0" ]; then
     echo "Docker image is not running. Starting it...";
     xhost +local:docker
-    docker run --rm \
+    # docker run --rm \
+    #     --gpus all \
+    #     -e DISPLAY=$DISPLAY \
+    #     -e XAUTHORITY=$XAUTHORITY \
+    #     -e XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR \
+    #     -e NVIDIA_DRIVER_CAPABILITIES=all \
+    #     -e 'QT_X11_NO_MITSHM=1' \
+    #     -e ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-1} \
+    #     -e RMW_IMPLEMENTATION=rmw_cyclonedds_cpp \
+    #     -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
+    #     -v "$(dirname "$(readlink -f "$0")")/apriltag_pose":/ros2_ws/src/apriltag_pose:ro \
+    #     --ipc host \
+    #     --device /dev/dri \
+    #     --net host \
+    #     --name apriltag_pose \
+    #     -ti inria_docker:apriltag_pose
+    docker rm apriltag_pose
+    docker run  \
+        --name apriltag_pose  \
         --gpus all \
         -e DISPLAY=$DISPLAY \
-        -e XAUTHORITY=$XAUTHORITY \
-        -e XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR \
         -e NVIDIA_DRIVER_CAPABILITIES=all \
-        -e 'QT_X11_NO_MITSHM=1' \
-        -e ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-1} \
-        -e RMW_IMPLEMENTATION=rmw_cyclonedds_cpp \
-        -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
-        -v "$(dirname "$(readlink -f "$0")")/apriltag_pose":/ros2_ws/src/apriltag_pose:ro \
-        --ipc host \
-        --device /dev/dri \
+        -e XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR \
+        -v /tmp/.X11-unix:/tmp/.X11-unix \
+        --env QT_X11_NO_MITSHM=1 \
         --net host \
-        --name apriltag_pose \
-        -ti inria_docker:orbbec
+        --ipc host \
+        --pid host \
+        --privileged \
+        -it \
+        -v $(pwd):/host_ws \
+        -v /dev:/dev \
+        -v /run/udev:/run/udev \
+        --device /dev/dri \
+        --device /dev/snd \
+        --device /dev/input \
+        --device /dev/bus/usb \
+        -w /ros2_ws \
+        inria_docker:apriltag_pose
 else
     echo "Docker image is already running. Opening new terminal...";
     docker exec -ti apriltag_pose /bin/bash
