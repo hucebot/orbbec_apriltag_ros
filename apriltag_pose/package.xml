@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+    <name>apriltag_pose</name>
+    <version>2.0.0</version>
+    <description>
+        Detect AprilTags in a colored point cloud and publish 6D poses via ROS 2
+    </description>
+    <maintainer email="quentin.rouxel@inria.fr">Quentin Rouxel</maintainer>
+    <license>BSD</license>
+
+    <buildtool_depend>ament_cmake</buildtool_depend>
+
+    <depend>rclcpp</depend>
+    <depend>geometry_msgs</depend>
+    <depend>sensor_msgs</depend>
+    <depend>tf2_ros</depend>
+
+    <export>
+        <build_type>ament_cmake</build_type>
+    </export>
+</package>
