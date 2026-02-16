@@ -1,43 +1,79 @@
-# Orbbec AprilTag ROS
+# AprilTag Pose
 
-This project utilizes the Orbbec Femto Bold RGB-D camera to detect 6D pose fiducial markers and publish them to ROS1:
-* Orbbec Femto Bolt Camera: https://www.orbbec.com/products/tof-camera/femto-bolt/
-* Orbbec SDK: https://github.com/orbbec/OrbbecSDK
+Detect AprilTag fiducial markers from any RGB-D source and publish their 6D poses via ROS 2. The node subscribes to a color image and an organized colored point cloud, making it compatible with any camera that publishes these standard ROS 2 topics (Orbbec, RealSense, ZED, Kinect, etc.).
+
 * AprilTags Library: https://april.eecs.umich.edu/software/apriltag
+* ROS 2 Humble on Ubuntu 22.04
 
-AprilTags detects the tag corners in the color image, and the point cloud is used to estimate the 3D position and orientation of the tag in the camera frame. Each detected tag's pose is published as a `geometry_msgs/PoseStamped` message in ROS1.
+AprilTags detects the tag corners in the color image, and the organized point cloud is used to estimate the 3D position and orientation of the tag. Each detected tag's pose is published as a `geometry_msgs/msg/PoseStamped` message.
 
 ## Docker
 
-Build the Docker image using:
+Build the Docker image:
 ```
- ./build.sh
+./build.sh
 ```
-Open a terminal in the Docker container for debugging or development:
+Run the container:
 ```
-./launch_bash.sh
+./run.sh
 ```
-Start the publisher directly in the Docker container using:
+Inside the container, launch the node:
 ```
-./launch_publisher.sh [is_display] [is_verbose] [ros_master_ip] [this_node_ip]
+ros2 launch apriltag_pose apriltag_pose.launch.py
 ```
 
 ## Usage
 
 ```
-./inria_orbbec_tags [is_display, default=0] [is_verbose, default=0] [ros_master_ip, default=127.0.0.1] [this_node_ip, default=127.0.0.1]
+ros2 launch apriltag_pose apriltag_pose.launch.py display:=true verbose:=true
 ```
-`is_display`: Enables the visualization of the color and depth camera, as well as the detected tags (0 or 1).
-`is_verbose`: Enables printing additional information to the standard output (0 or 1).
-`ros_master_ip`: Defines the IP address for the ROS Master (string).
-`this_node_ip`: Assigns the IP address for this ROS node (string).
-Note that the ROS Master must be running externally.
+With custom topics:
+```
+ros2 launch apriltag_pose apriltag_pose.launch.py image_topic:=/my_camera/color/image_raw cloud_topic:=/my_camera/depth/color/points
+```
 
-## ROS Topic
+## ROS 2 Parameters
 
-For each detected AprilTag marker, the publisher outputs a `geometry_msgs/PoseStamped` message as fast as possible, up to 30Hz, with the topic name `/inria_orbbec_tags/pose_tag_{TagID}`.
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `verbose` | bool | `false` | Enable verbose timing output |
+| `display` | bool | `false` | Enable OpenCV visualization of detected tags |
+| `apply_coordinate_transform` | bool | `false` | Apply (x,y,z) to (z,-x,-y) coordinate transform |
+| `frame_id` | string | `camera_color_optical_frame` | TF frame_id for published poses |
+| `image_topic` | string | `/camera/camera/color/image_raw` | Color image topic to subscribe to |
+| `cloud_topic` | string | `/camera/camera/depth/color/points` | Organized point cloud topic to subscribe to |
+| `sync_queue_size` | int | `30` | Queue size for approximate time synchronization |
+
+## ROS 2 Topics
+
+### Subscribed
+- `image_topic` (`sensor_msgs/msg/Image`): Color image
+- `cloud_topic` (`sensor_msgs/msg/PointCloud2`): Organized colored point cloud, aligned to the color image
+
+### Published
+For each detected AprilTag marker, a `geometry_msgs/msg/PoseStamped` message is published on `apriltag_pose/pose_tag_{TagID}`.
+
+## Requirements
+
+The point cloud must be:
+- **Organized**: `height > 1`, with dimensions matching the color image
+- **Aligned**: Depth-to-color registered so that pixel (x, y) in the image corresponds to the point at (x, y) in the point cloud
+
+Most RGB-D camera ROS 2 drivers provide an aligned/registered point cloud topic (e.g. `camera/depth_registered/points`).
+
+## Building in an Existing Workspace
+
+To add this package to an existing ROS 2 workspace:
+```bash
+cd /ros2_ws/src
+cp -r /path/to/apriltag_pose .
+cd /ros2_ws
+colcon build --packages-select apriltag_pose
+source install/setup.bash
+```
+
+Note: The AprilTag library must be built at `/opt/apriltag` (see Dockerfile for reference).
 
 ## License
 
 Licensed under the [BSD License](LICENSE)
-
