@@ -159,7 +159,7 @@ public:
         tagFamily_ = tag36h11_create();
         tagDetector_ = apriltag_detector_create();
         apriltag_detector_add_family(tagDetector_, tagFamily_);
-        tagDetector_->quad_decimate = 2.0;
+        tagDetector_->quad_decimate = 1.0;
         tagDetector_->quad_sigma = 0.0;
         tagDetector_->refine_edges = 1;
         tagDetector_->decode_sharpening = 0.25;
@@ -259,25 +259,56 @@ private:
         uint32_t row_step = cloudMsg->row_step;
         const uint8_t* cloudData = cloudMsg->data.data();
 
-        //Extract grayscale image from point cloud RGB data
+        //Extract grayscale image from point cloud RGB data.
+        //Pixels with invalid depth (NaN/zero z) may have garbage RGB,
+        //which creates black holes that break AprilTag quad detection.
+        //We mark those pixels and inpaint them from valid neighbors.
         cv::Mat matColorGray(height, width, CV_8UC1);
+        cv::Mat invalidMask(height, width, CV_8UC1, cv::Scalar(0));
         cv::Mat matColorBGR;
         if (is_display_) {
             matColorBGR = cv::Mat(height, width, CV_8UC3);
         }
+        int invalidNan = 0, invalidZero = 0, invalidNearZero = 0;
         for (int py = 0; py < height; py++) {
             const uint8_t* rowPtr = cloudData + py * row_step;
             for (int px = 0; px < width; px++) {
-                const uint8_t* rgbPtr = rowPtr + px * point_step + offset_rgb;
-                //ROS PointCloud2 rgb field: stored as float32, bytes are [B, G, R, A]
+                const uint8_t* ptPtr = rowPtr + px * point_step;
+                float z = *reinterpret_cast<const float*>(ptPtr + offset_z);
+                const uint8_t* rgbPtr = ptPtr + offset_rgb;
                 uint8_t b = rgbPtr[0];
                 uint8_t g = rgbPtr[1];
                 uint8_t r = rgbPtr[2];
-                matColorGray.at<uint8_t>(py, px) =
-                    static_cast<uint8_t>(0.299 * r + 0.587 * g + 0.114 * b);
-                if (is_display_) {
-                    matColorBGR.at<cv::Vec3b>(py, px) = cv::Vec3b(b, g, r);
+                if (!std::isfinite(z) || z < 1e-3) {
+                    if (!std::isfinite(z)) invalidNan++;
+                    else if (z == 0.0f) invalidZero++;
+                    else invalidNearZero++;
+                    matColorGray.at<uint8_t>(py, px) = 0;
+                    invalidMask.at<uint8_t>(py, px) = 255;
+                    if (is_display_) {
+                        matColorBGR.at<cv::Vec3b>(py, px) = cv::Vec3b(0, 0, 0);
+                    }
+                } else {
+                    matColorGray.at<uint8_t>(py, px) =
+                        static_cast<uint8_t>(0.299 * r + 0.587 * g + 0.114 * b);
+                    if (is_display_) {
+                        matColorBGR.at<cv::Vec3b>(py, px) = cv::Vec3b(b, g, r);
+                    }
                 }
+            }
+        }
+        int totalInvalid = invalidNan + invalidZero + invalidNearZero;
+        int totalPixels = width * height;
+        //Inpaint invalid pixels so depth holes don't corrupt tag detection
+        if (totalInvalid > 0) {
+            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                "Invalid pixels: %d/%d (%.1f%%) — NaN: %d, zero: %d, near-zero: %d",
+                totalInvalid, totalPixels,
+                100.0 * totalInvalid / totalPixels,
+                invalidNan, invalidZero, invalidNearZero);
+            cv::inpaint(matColorGray, invalidMask, matColorGray, 3, cv::INPAINT_TELEA);
+            if (is_display_) {
+                cv::inpaint(matColorBGR, invalidMask, matColorBGR, 3, cv::INPAINT_TELEA);
             }
         }
 
@@ -306,6 +337,37 @@ private:
         };
         zarray_t* detections = apriltag_detector_detect(tagDetector_, &image);
         auto timeDetectionEnd = std::chrono::high_resolution_clock::now();
+
+        //Look up transform from parent to camera frame if needed (for pose publishing)
+        Eigen::Quaterniond q_pc = Eigen::Quaterniond::Identity();
+        Eigen::Vector3d t_pc = Eigen::Vector3d::Zero();
+        bool useParentForPoses = !tf_parent_frame_.empty() && tfBuffer_;
+        std::string pose_frame_id = frame_id_;
+
+        if (useParentForPoses) {
+            geometry_msgs::msg::TransformStamped parentToCam;
+            try {
+                parentToCam = tfBuffer_->lookupTransform(
+                    tf_parent_frame_, frame_id_,
+                    tf2::TimePointZero,
+                    tf2::durationFromSec(transform_timeout_));
+                q_pc = Eigen::Quaterniond(
+                    parentToCam.transform.rotation.w,
+                    parentToCam.transform.rotation.x,
+                    parentToCam.transform.rotation.y,
+                    parentToCam.transform.rotation.z);
+                t_pc = Eigen::Vector3d(
+                    parentToCam.transform.translation.x,
+                    parentToCam.transform.translation.y,
+                    parentToCam.transform.translation.z);
+                pose_frame_id = tf_parent_frame_;
+            } catch (const tf2::TransformException& ex) {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                    "Could not look up transform %s -> %s for pose publishing: %s. Using camera frame instead.",
+                    tf_parent_frame_.c_str(), frame_id_.c_str(), ex.what());
+                useParentForPoses = false;
+            }
+        }
 
         //Process each detected tag
         std::vector<bool> is_pose_detected;
@@ -364,23 +426,26 @@ private:
             //Store camera-frame pose for TF computation
             camTagPoses.push_back({det->id, pos0, quatCam});
 
-            //Apply optional coordinate transformation for pose publishing
+            //Transform to parent frame if requested
             Eigen::Vector3d posTag = pos0;
             Eigen::Quaterniond quatTag = quatCam;
-            if (apply_coordinate_transform_) {
-                pos0 = Eigen::Vector3d(pos0.z(), -pos0.x(), -pos0.y());
-                pos1 = Eigen::Vector3d(pos1.z(), -pos1.x(), -pos1.y());
-                pos2 = Eigen::Vector3d(pos2.z(), -pos2.x(), -pos2.y());
-                pos3 = Eigen::Vector3d(pos3.z(), -pos3.x(), -pos3.y());
-                Eigen::Vector3d vectZ = (pos1 - pos2).normalized();
-                Eigen::Vector3d vectY = -(pos3 - pos2).normalized();
-                Eigen::Matrix3d rotTag = Eigen::Matrix3d::Identity();
-                rotTag.col(0) = -vectY.cross(vectZ);
-                rotTag.col(1) = -vectZ;
-                rotTag.col(2) = -vectY;
-                quatTag = Eigen::Quaterniond(rotTag);
+            if (useParentForPoses) {
+                quatTag = q_pc * quatCam;
                 quatTag.normalize();
-                posTag = pos0;
+                posTag = q_pc * pos0 + t_pc;
+            }
+
+            //Apply optional coordinate transformation for pose publishing
+            if (apply_coordinate_transform_) {
+                Eigen::Vector3d pos0_trans = Eigen::Vector3d(posTag.z(), -posTag.x(), -posTag.y());
+                static const Eigen::Quaterniond coordRot = []() {
+                    Eigen::Matrix3d R;
+                    R << 0, 0, 1, -1, 0, 0, 0, -1, 0;
+                    return Eigen::Quaterniond(R);
+                }();
+                quatTag = coordRot * quatTag;
+                quatTag.normalize();
+                posTag = pos0_trans;
             }
 
             int indexTag = det->id;
@@ -394,7 +459,7 @@ private:
             //Publish tag pose message
             geometry_msgs::msg::PoseStamped msg;
             msg.header.stamp = cloudMsg->header.stamp;
-            msg.header.frame_id = frame_id_;
+            msg.header.frame_id = pose_frame_id;
             msg.pose.position.x = posTag.x();
             msg.pose.position.y = posTag.y();
             msg.pose.position.z = posTag.z();
@@ -417,17 +482,24 @@ private:
                 if (poseFilter_->getFilteredPose(tag.id, filtPos, filtQuat)) {
                     tfTagPoses.push_back({tag.id, filtPos, filtQuat});
 
-                    //Apply optional coordinate transformation
+                    //Transform to parent frame if requested
                     Eigen::Vector3d pubPos = filtPos;
                     Eigen::Quaterniond pubQuat = filtQuat;
+                    if (useParentForPoses) {
+                        pubQuat = q_pc * filtQuat;
+                        pubQuat.normalize();
+                        pubPos = q_pc * filtPos + t_pc;
+                    }
+
+                    //Apply optional coordinate transformation
                     if (apply_coordinate_transform_) {
                         static const Eigen::Quaterniond coordRot = []() {
                             Eigen::Matrix3d R;
                             R << 0, 0, 1, -1, 0, 0, 0, -1, 0;
                             return Eigen::Quaterniond(R);
                         }();
-                        pubPos = Eigen::Vector3d(filtPos.z(), -filtPos.x(), -filtPos.y());
-                        pubQuat = coordRot * filtQuat;
+                        pubPos = Eigen::Vector3d(pubPos.z(), -pubPos.x(), -pubPos.y());
+                        pubQuat = coordRot * pubQuat;
                         pubQuat.normalize();
                     }
 
@@ -439,7 +511,7 @@ private:
 
                     geometry_msgs::msg::PoseStamped msg;
                     msg.header.stamp = cloudMsg->header.stamp;
-                    msg.header.frame_id = frame_id_;
+                    msg.header.frame_id = pose_frame_id;
                     msg.pose.position.x = pubPos.x();
                     msg.pose.position.y = pubPos.y();
                     msg.pose.position.z = pubPos.z();
