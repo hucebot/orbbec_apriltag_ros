@@ -123,24 +123,20 @@ public:
         //Declare and load parameters
         this->declare_parameter("verbose", false);
         this->declare_parameter("display", false);
-        this->declare_parameter("apply_coordinate_transform", false);
-        this->declare_parameter("frame_id", "camera_color_optical_frame");
         this->declare_parameter("cloud_topic", "/camera/camera/depth/color/points");
         this->declare_parameter("publish_tf", false);
         this->declare_parameter("tag_frame_prefix", "apriltag");
-        this->declare_parameter("tf_parent_frame", "");
+        this->declare_parameter("publishing_frame", "");
         this->declare_parameter("transform_timeout", 0.1);
         this->declare_parameter("filter_type", "none");
         this->declare_parameter("filter_window", 5);
 
         is_verbose_ = this->get_parameter("verbose").as_bool();
         is_display_ = this->get_parameter("display").as_bool();
-        apply_coordinate_transform_ = this->get_parameter("apply_coordinate_transform").as_bool();
-        frame_id_ = this->get_parameter("frame_id").as_string();
         std::string cloud_topic = this->get_parameter("cloud_topic").as_string();
         publish_tf_ = this->get_parameter("publish_tf").as_bool();
         tag_frame_prefix_ = this->get_parameter("tag_frame_prefix").as_string();
-        tf_parent_frame_ = this->get_parameter("tf_parent_frame").as_string();
+        publishing_frame_ = this->get_parameter("publishing_frame").as_string();
         transform_timeout_ = this->get_parameter("transform_timeout").as_double();
         std::string filter_type = this->get_parameter("filter_type").as_string();
         int filter_window = this->get_parameter("filter_window").as_int();
@@ -171,19 +167,25 @@ public:
             cv::namedWindow("color", cv::WINDOW_NORMAL | cv::WINDOW_KEEPRATIO);
         }
 
-        //Setup TF broadcaster and optional TF listener for parent frame chaining
+        //Setup TF listener for parent frame transform (needed for pose publishing)
+        if (!publishing_frame_.empty()) {
+            tfBuffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
+            tfListener_ = std::make_shared<tf2_ros::TransformListener>(*tfBuffer_);
+            RCLCPP_INFO(this->get_logger(),
+                "Poses will be transformed to parent frame: %s", publishing_frame_.c_str());
+        }
+
+        //Setup optional TF broadcaster
         if (publish_tf_) {
             tfBroadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(this);
-            if (!tf_parent_frame_.empty()) {
-                tfBuffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
-                tfListener_ = std::make_shared<tf2_ros::TransformListener>(*tfBuffer_);
-                RCLCPP_INFO(this->get_logger(),
-                    "TF broadcasting enabled: %s -> %s_<id> (via camera frame %s)",
-                    tf_parent_frame_.c_str(), tag_frame_prefix_.c_str(), frame_id_.c_str());
-            } else {
+            if (!publishing_frame_.empty()) {
                 RCLCPP_INFO(this->get_logger(),
                     "TF broadcasting enabled: %s -> %s_<id>",
-                    frame_id_.c_str(), tag_frame_prefix_.c_str());
+                    publishing_frame_.c_str(), tag_frame_prefix_.c_str());
+            } else {
+                RCLCPP_INFO(this->get_logger(),
+                    "TF broadcasting enabled: <cloud_frame> -> %s_<id>",
+                    tag_frame_prefix_.c_str());
             }
         }
 
@@ -300,12 +302,13 @@ private:
         int totalInvalid = invalidNan + invalidZero + invalidNearZero;
         int totalPixels = width * height;
         //Inpaint invalid pixels so depth holes don't corrupt tag detection
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+            "Invalid pixels: %d/%d (%.1f%%) — NaN: %d, zero: %d, near-zero: %d",
+            totalInvalid, totalPixels,
+            100.0 * totalInvalid / totalPixels,
+            invalidNan, invalidZero, invalidNearZero);
+
         if (totalInvalid > 0) {
-            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                "Invalid pixels: %d/%d (%.1f%%) — NaN: %d, zero: %d, near-zero: %d",
-                totalInvalid, totalPixels,
-                100.0 * totalInvalid / totalPixels,
-                invalidNan, invalidZero, invalidNearZero);
             cv::inpaint(matColorGray, invalidMask, matColorGray, 3, cv::INPAINT_TELEA);
             if (is_display_) {
                 cv::inpaint(matColorBGR, invalidMask, matColorBGR, 3, cv::INPAINT_TELEA);
@@ -338,34 +341,35 @@ private:
         zarray_t* detections = apriltag_detector_detect(tagDetector_, &image);
         auto timeDetectionEnd = std::chrono::high_resolution_clock::now();
 
-        //Look up transform from parent to camera frame if needed (for pose publishing)
+        //Determine the frame for publishing
+        std::string camera_frame = cloudMsg->header.frame_id;
         Eigen::Quaterniond q_pc = Eigen::Quaterniond::Identity();
         Eigen::Vector3d t_pc = Eigen::Vector3d::Zero();
-        bool useParentForPoses = !tf_parent_frame_.empty() && tfBuffer_;
-        std::string pose_frame_id = frame_id_;
+        bool usePublishingFrame = !publishing_frame_.empty() && tfBuffer_;
+        std::string pose_frame_id = camera_frame;
 
-        if (useParentForPoses) {
-            geometry_msgs::msg::TransformStamped parentToCam;
+        if (usePublishingFrame) {
+            geometry_msgs::msg::TransformStamped tfStamped;
             try {
-                parentToCam = tfBuffer_->lookupTransform(
-                    tf_parent_frame_, frame_id_,
+                tfStamped = tfBuffer_->lookupTransform(
+                    publishing_frame_, camera_frame,
                     tf2::TimePointZero,
                     tf2::durationFromSec(transform_timeout_));
                 q_pc = Eigen::Quaterniond(
-                    parentToCam.transform.rotation.w,
-                    parentToCam.transform.rotation.x,
-                    parentToCam.transform.rotation.y,
-                    parentToCam.transform.rotation.z);
+                    tfStamped.transform.rotation.w,
+                    tfStamped.transform.rotation.x,
+                    tfStamped.transform.rotation.y,
+                    tfStamped.transform.rotation.z);
                 t_pc = Eigen::Vector3d(
-                    parentToCam.transform.translation.x,
-                    parentToCam.transform.translation.y,
-                    parentToCam.transform.translation.z);
-                pose_frame_id = tf_parent_frame_;
+                    tfStamped.transform.translation.x,
+                    tfStamped.transform.translation.y,
+                    tfStamped.transform.translation.z);
+                pose_frame_id = publishing_frame_;
             } catch (const tf2::TransformException& ex) {
                 RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                    "Could not look up transform %s -> %s for pose publishing: %s. Using camera frame instead.",
-                    tf_parent_frame_.c_str(), frame_id_.c_str(), ex.what());
-                useParentForPoses = false;
+                    "Could not look up transform %s -> %s: %s. Publishing in camera frame.",
+                    publishing_frame_.c_str(), camera_frame.c_str(), ex.what());
+                usePublishingFrame = false;
             }
         }
 
@@ -429,23 +433,10 @@ private:
             //Transform to parent frame if requested
             Eigen::Vector3d posTag = pos0;
             Eigen::Quaterniond quatTag = quatCam;
-            if (useParentForPoses) {
+            if (usePublishingFrame) {
                 quatTag = q_pc * quatCam;
                 quatTag.normalize();
                 posTag = q_pc * pos0 + t_pc;
-            }
-
-            //Apply optional coordinate transformation for pose publishing
-            if (apply_coordinate_transform_) {
-                Eigen::Vector3d pos0_trans = Eigen::Vector3d(posTag.z(), -posTag.x(), -posTag.y());
-                static const Eigen::Quaterniond coordRot = []() {
-                    Eigen::Matrix3d R;
-                    R << 0, 0, 1, -1, 0, 0, 0, -1, 0;
-                    return Eigen::Quaterniond(R);
-                }();
-                quatTag = coordRot * quatTag;
-                quatTag.normalize();
-                posTag = pos0_trans;
             }
 
             int indexTag = det->id;
@@ -485,22 +476,10 @@ private:
                     //Transform to parent frame if requested
                     Eigen::Vector3d pubPos = filtPos;
                     Eigen::Quaterniond pubQuat = filtQuat;
-                    if (useParentForPoses) {
+                    if (usePublishingFrame) {
                         pubQuat = q_pc * filtQuat;
                         pubQuat.normalize();
                         pubPos = q_pc * filtPos + t_pc;
-                    }
-
-                    //Apply optional coordinate transformation
-                    if (apply_coordinate_transform_) {
-                        static const Eigen::Quaterniond coordRot = []() {
-                            Eigen::Matrix3d R;
-                            R << 0, 0, 1, -1, 0, 0, 0, -1, 0;
-                            return Eigen::Quaterniond(R);
-                        }();
-                        pubPos = Eigen::Vector3d(pubPos.z(), -pubPos.x(), -pubPos.y());
-                        pubQuat = coordRot * pubQuat;
-                        pubQuat.normalize();
                     }
 
                     //Initialize publisher for new filtered tag
@@ -616,19 +595,19 @@ private:
         //Optionally look up T_parent_cam once for all tags
         Eigen::Quaterniond q_pc = Eigen::Quaterniond::Identity();
         Eigen::Vector3d t_pc = Eigen::Vector3d::Zero();
-        bool useParent = !tf_parent_frame_.empty() && tfBuffer_;
+        bool useParent = !publishing_frame_.empty() && tfBuffer_;
 
         if (useParent) {
             geometry_msgs::msg::TransformStamped parentToCam;
             try {
                 parentToCam = tfBuffer_->lookupTransform(
-                    tf_parent_frame_, header.frame_id,
+                    publishing_frame_, header.frame_id,
                     tf2::TimePointZero,
                     tf2::durationFromSec(transform_timeout_));
             } catch (const tf2::TransformException& ex) {
                 RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                     "Could not look up transform %s -> %s: %s",
-                    tf_parent_frame_.c_str(), header.frame_id.c_str(), ex.what());
+                    publishing_frame_.c_str(), header.frame_id.c_str(), ex.what());
                 return;
             }
             q_pc = Eigen::Quaterniond(
@@ -655,7 +634,7 @@ private:
                 q_out = q_pc * tag.orientation;
                 q_out.normalize();
                 t_out = q_pc * tag.position + t_pc;
-                parent_frame = tf_parent_frame_;
+                parent_frame = publishing_frame_;
             }
 
             geometry_msgs::msg::TransformStamped tf;
@@ -690,18 +669,16 @@ private:
     apriltag_family_t* tagFamily_;
     apriltag_detector_t* tagDetector_;
 
-    //TF lookup (for tf_parent_frame chaining)
+    //TF lookup (for publishing_frame chaining)
     std::shared_ptr<tf2_ros::Buffer> tfBuffer_;
     std::shared_ptr<tf2_ros::TransformListener> tfListener_;
 
     //Parameters
     bool is_verbose_;
     bool is_display_;
-    bool apply_coordinate_transform_;
     bool publish_tf_;
-    std::string frame_id_;
     std::string tag_frame_prefix_;
-    std::string tf_parent_frame_;
+    std::string publishing_frame_;
     double transform_timeout_;
 
     //State
