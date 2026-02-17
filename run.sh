@@ -24,6 +24,10 @@ if [ $IsRunning -eq "0" ]; then
         --device /dev/snd \
         --device /dev/input \
         --device /dev/bus/usb \
+        -e ROS_DOMAIN_ID=1\
+        -v $(pwd)/configs/:/xml_configs \
+        -e RMW_IMPLEMENTATION=rmw_cyclonedds_cpp\
+        -e CYCLONEDDS_URI=/xml_configs/cyclonedds.xml\
         -w /ros2_ws \
         inria_docker:apriltag_pose
 else
