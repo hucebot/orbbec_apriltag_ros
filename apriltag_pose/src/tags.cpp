@@ -306,10 +306,10 @@ private:
                 totalInvalid, totalPixels,
                 100.0 * totalInvalid / totalPixels,
                 invalidNan, invalidZero, invalidNearZero);
-            cv::inpaint(matColorGray, invalidMask, matColorGray, 3, cv::INPAINT_TELEA);
-            if (is_display_) {
-                cv::inpaint(matColorBGR, invalidMask, matColorBGR, 3, cv::INPAINT_TELEA);
-            }
+            // cv::inpaint(matColorGray, invalidMask, matColorGray, 3, cv::INPAINT_TELEA);
+            // if (is_display_) {
+            //     cv::inpaint(matColorBGR, invalidMask, matColorBGR, 3, cv::INPAINT_TELEA);
+            // }
         }
 
         //Helper: look up 3D point at pixel (px, py)

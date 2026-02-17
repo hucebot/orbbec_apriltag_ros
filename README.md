@@ -24,14 +24,17 @@ ros2 launch apriltag_pose apriltag_pose.launch.py
 
 ## Usage
 
+With verbose and display
 ```
 ros2 launch apriltag_pose apriltag_pose.launch.py display:=true verbose:=true
 ```
+
 With custom topics:
 ```
 ros2 launch apriltag_pose apriltag_pose.launch.py image_topic:=/my_camera/color/image_raw cloud_topic:=/my_camera/depth/color/points
 ```
 
+With another output `frame_id`
 ```
 ros2 launch apriltag_pose apriltag_pose.launch.py image_topic:=/tiago_head_camera_down/color/image_raw cloud_topic:=/tiago_head_camera_down/depth_registered/points display:=true verbose:=true frame_id:=tiago_head_camera_down_color_optical_frame
 ```
