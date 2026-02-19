@@ -17,12 +17,14 @@ services:
       - XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}
       - NVIDIA_DRIVER_CAPABILITIES=all
       - ROS_DOMAIN_ID=1
-      - RMW_IMPLEMENTATION=
+      - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+      - CYCLONEDDS_URI=file:///cyclonedds.xml
     volumes:
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
       - /dev/shm:/dev/shm
       - ./apriltag_pose:/ros2_ws/src/apriltag_pose:ro
       - ./entrypoint.sh:/entrypoint.sh:ro
+      - ./docker/cyclonedds.xml:/cyclonedds.xml:ro
     devices:
       - /dev/dri:/dev/dri
     deploy:

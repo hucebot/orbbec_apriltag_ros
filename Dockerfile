@@ -39,6 +39,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && \
     rm -rf /var/lib/apt/lists/*
 
+#Install CycloneDDS
+RUN apt-get update && apt-get install -y ros-${ROS_DISTRO}-rmw-cyclonedds-cpp
+
 #Install OpenCV
 RUN apt-get update && apt-get install -y libopencv-dev libopencv-core-dev opencv-data
 

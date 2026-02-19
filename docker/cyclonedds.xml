@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<CycloneDDS xmlns="https://cdds.io/config">
+  <Domain id="any">
+    <General>
+      <!-- Uses whichever interface is up (ethernet preferred when connected) -->
+      <!-- To force a specific interface: <NetworkInterfaceAddress>eno2</NetworkInterfaceAddress> -->
+      <AllowMulticast>default</AllowMulticast>
+    </General>
+  </Domain>
+</CycloneDDS>

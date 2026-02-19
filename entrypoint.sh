@@ -5,8 +5,6 @@ echo "=== apriltag_pose entrypoint ==="
 
 source /opt/ros/${ROS_DISTRO:-jazzy}/setup.bash
 
-unset RMW_IMPLEMENTATION
-
 cd /ros2_ws
 
 echo "=== Building apriltag_pose ==="
