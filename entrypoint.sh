@@ -3,7 +3,7 @@ set -e
 
 echo "=== apriltag_pose entrypoint ==="
 
-source /opt/ros/humble/setup.bash
+source /opt/ros/${ROS_DISTRO:-jazzy}/setup.bash
 
 unset RMW_IMPLEMENTATION
 
@@ -14,6 +14,6 @@ colcon build --packages-select apriltag_pose
 source /ros2_ws/install/setup.bash
 
 echo "=== Launching apriltag_pose ==="
-exec ros2 launch apriltag_pose apriltag_pose.launch.py \
+exec ros2 launch apriltag_pose apriltag_pose.launch.py \ filter_type:=median \ filter_window_size:=5
     publishing_frame:=pelvis \
     verbose:=true

@@ -1,10 +1,10 @@
-# apriltag_pose - AprilTag Detection (ROS Humble + OpenGL)
+# apriltag_pose - AprilTag Detection (ROS Jazzy + CUDA)
 # Standalone: docker compose up
 # Combined:  included from ~/docker-compose.yml
 
 services:
   apriltag_pose:
-    image: inria_docker:orbbec
+    image: inria_docker:april_tag_jazzy
     container_name: apriltag_pose
     stdin_open: true
     tty: true
