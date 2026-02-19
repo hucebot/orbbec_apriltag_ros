@@ -1,7 +1,5 @@
 #include <iostream>
 #include <map>
-#include <deque>
-#include <algorithm>
 #include <cmath>
 #include <chrono>
 #include <functional>
@@ -20,101 +18,6 @@ extern "C" {
 #include <tag36h11.h>
 }
 
-//---------------------------------------------------------------------
-// Pose filter interface — add new filter types by subclassing this
-//---------------------------------------------------------------------
-class PoseFilter {
-public:
-    virtual ~PoseFilter() = default;
-    virtual void addPose(int tag_id,
-                         const Eigen::Vector3d& pos,
-                         const Eigen::Quaterniond& quat) = 0;
-    virtual bool getFilteredPose(int tag_id,
-                                 Eigen::Vector3d& pos,
-                                 Eigen::Quaterniond& quat) const = 0;
-};
-
-//---------------------------------------------------------------------
-// Sliding-window median filter (component-wise for position & quaternion)
-//---------------------------------------------------------------------
-class MedianPoseFilter : public PoseFilter {
-public:
-    explicit MedianPoseFilter(int window_size) : windowSize_(window_size) {}
-
-    void addPose(int tag_id,
-                 const Eigen::Vector3d& pos,
-                 const Eigen::Quaterniond& quat) override
-    {
-        auto& buf = buffers_[tag_id];
-        buf.push_back({pos, quat});
-        if (static_cast<int>(buf.size()) > windowSize_) {
-            buf.pop_front();
-        }
-    }
-
-    bool getFilteredPose(int tag_id,
-                         Eigen::Vector3d& pos,
-                         Eigen::Quaterniond& quat) const override
-    {
-        auto it = buffers_.find(tag_id);
-        if (it == buffers_.end() || it->second.empty()) return false;
-
-        const auto& buf = it->second;
-
-        //Position: component-wise median
-        std::vector<double> xs, ys, zs;
-        xs.reserve(buf.size());
-        ys.reserve(buf.size());
-        zs.reserve(buf.size());
-        for (const auto& e : buf) {
-            xs.push_back(e.position.x());
-            ys.push_back(e.position.y());
-            zs.push_back(e.position.z());
-        }
-        pos = Eigen::Vector3d(median(xs), median(ys), median(zs));
-
-        //Orientation: align to same hemisphere, then component-wise median
-        std::vector<double> qxs, qys, qzs, qws;
-        qxs.reserve(buf.size());
-        qys.reserve(buf.size());
-        qzs.reserve(buf.size());
-        qws.reserve(buf.size());
-        const Eigen::Vector4d ref = buf.front().orientation.coeffs();
-        for (const auto& e : buf) {
-            Eigen::Vector4d q = e.orientation.coeffs();
-            if (q.dot(ref) < 0) q = -q;
-            qxs.push_back(q.x());
-            qys.push_back(q.y());
-            qzs.push_back(q.z());
-            qws.push_back(q.w());
-        }
-        //Eigen::Quaterniond stores (x,y,z,w) in coeffs but constructor is (w,x,y,z)
-        quat = Eigen::Quaterniond(median(qws), median(qxs), median(qys), median(qzs));
-        quat.normalize();
-
-        return true;
-    }
-
-private:
-    struct PoseEntry {
-        Eigen::Vector3d position;
-        Eigen::Quaterniond orientation;
-    };
-
-    static double median(std::vector<double> v) {
-        size_t n = v.size();
-        auto mid = v.begin() + n / 2;
-        std::nth_element(v.begin(), mid, v.end());
-        if (n % 2 == 1) return *mid;
-        double upper = *mid;
-        std::nth_element(v.begin(), v.begin() + n / 2 - 1, v.end());
-        return (v[n / 2 - 1] + upper) / 2.0;
-    }
-
-    int windowSize_;
-    mutable std::map<int, std::deque<PoseEntry>> buffers_;
-};
-
 class AprilTagNode : public rclcpp::Node {
 public:
     AprilTagNode()
@@ -128,9 +31,6 @@ public:
         this->declare_parameter("tag_frame_prefix", "apriltag");
         this->declare_parameter("publishing_frame", "");
         this->declare_parameter("transform_timeout", 0.1);
-        this->declare_parameter("filter_type", "none");
-        this->declare_parameter("filter_window", 5);
-
         is_verbose_ = this->get_parameter("verbose").as_bool();
         is_display_ = this->get_parameter("display").as_bool();
         std::string cloud_topic = this->get_parameter("cloud_topic").as_string();
@@ -138,18 +38,6 @@ public:
         tag_frame_prefix_ = this->get_parameter("tag_frame_prefix").as_string();
         publishing_frame_ = this->get_parameter("publishing_frame").as_string();
         transform_timeout_ = this->get_parameter("transform_timeout").as_double();
-        std::string filter_type = this->get_parameter("filter_type").as_string();
-        int filter_window = this->get_parameter("filter_window").as_int();
-
-        //Create pose filter if requested
-        if (filter_type == "median") {
-            poseFilter_ = std::make_unique<MedianPoseFilter>(filter_window);
-            RCLCPP_INFO(this->get_logger(),
-                "Pose filter enabled: median (window=%d)", filter_window);
-        } else if (filter_type != "none") {
-            RCLCPP_WARN(this->get_logger(),
-                "Unknown filter_type '%s', filtering disabled", filter_type.c_str());
-        }
 
         //Initialize AprilTag detector
         tagFamily_ = tag36h11_create();
@@ -463,51 +351,9 @@ private:
             is_pose_detected.push_back(true);
         }
 
-        //Filter poses if enabled, publish filtered poses, select poses for TF
-        std::vector<CamTagPose> tfTagPoses;
-        if (poseFilter_) {
-            for (const auto& tag : camTagPoses) {
-                poseFilter_->addPose(tag.id, tag.position, tag.orientation);
-                Eigen::Vector3d filtPos;
-                Eigen::Quaterniond filtQuat;
-                if (poseFilter_->getFilteredPose(tag.id, filtPos, filtQuat)) {
-                    tfTagPoses.push_back({tag.id, filtPos, filtQuat});
-
-                    //Transform to parent frame if requested
-                    Eigen::Vector3d pubPos = filtPos;
-                    Eigen::Quaterniond pubQuat = filtQuat;
-                    if (usePublishingFrame) {
-                        pubQuat = q_pc * filtQuat;
-                        pubQuat.normalize();
-                        pubPos = q_pc * filtPos + t_pc;
-                    }
-
-                    //Initialize publisher for new filtered tag
-                    if (filteredPub_.count(tag.id) == 0) {
-                        filteredPub_[tag.id] = this->create_publisher<geometry_msgs::msg::PoseStamped>(
-                            "apriltag_pose/filtered_pose_tag_" + std::to_string(tag.id), 10);
-                    }
-
-                    geometry_msgs::msg::PoseStamped msg;
-                    msg.header.stamp = cloudMsg->header.stamp;
-                    msg.header.frame_id = pose_frame_id;
-                    msg.pose.position.x = pubPos.x();
-                    msg.pose.position.y = pubPos.y();
-                    msg.pose.position.z = pubPos.z();
-                    msg.pose.orientation.x = pubQuat.x();
-                    msg.pose.orientation.y = pubQuat.y();
-                    msg.pose.orientation.z = pubQuat.z();
-                    msg.pose.orientation.w = pubQuat.w();
-                    filteredPub_[tag.id]->publish(msg);
-                }
-            }
-        } else {
-            tfTagPoses = camTagPoses;
-        }
-
-        //Publish per-tag TF frames (from filtered poses when available)
-        if (publish_tf_ && !tfTagPoses.empty()) {
-            publishTagTransforms(cloudMsg->header, tfTagPoses);
+        //Publish per-tag TF frames
+        if (publish_tf_ && !camTagPoses.empty()) {
+            publishTagTransforms(cloudMsg->header, camTagPoses);
         }
 
         //Draw detected tags on color frame
@@ -657,10 +503,6 @@ private:
 
     //Publishers indexed by tag id
     std::map<int, rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr> containerPub_;
-    std::map<int, rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr> filteredPub_;
-
-    //Pose filter
-    std::unique_ptr<PoseFilter> poseFilter_;
 
     //TF broadcaster
     std::unique_ptr<tf2_ros::TransformBroadcaster> tfBroadcaster_;
