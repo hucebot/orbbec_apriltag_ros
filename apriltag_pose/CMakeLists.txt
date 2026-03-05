@@ -10,11 +10,14 @@ find_package(rclcpp REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
+find_package(message_filters REQUIRED)
+find_package(cv_bridge REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(OpenCV REQUIRED)
 
 include_directories(
     /opt/apriltag
+    ${cv_bridge_INCLUDE_DIRS}
 )
 link_directories(
     /opt/apriltag/build
@@ -30,6 +33,8 @@ ament_target_dependencies(apriltag_pose
     geometry_msgs
     sensor_msgs
     tf2_ros
+    message_filters
+    cv_bridge
 )
 target_link_libraries(apriltag_pose
     ${OpenCV_LIBS}
@@ -37,6 +42,9 @@ target_link_libraries(apriltag_pose
 )
 
 install(TARGETS apriltag_pose
+    DESTINATION lib/${PROJECT_NAME}
+)
+install(PROGRAMS scripts/apriltag_to_box.py
     DESTINATION lib/${PROJECT_NAME}
 )
 install(DIRECTORY launch/

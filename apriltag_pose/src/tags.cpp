@@ -9,9 +9,15 @@
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <sensor_msgs/msg/image.hpp>
+#include <sensor_msgs/msg/camera_info.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
+#include <message_filters/subscriber.h>
+#include <message_filters/sync_policies/approximate_time.h>
+#include <message_filters/synchronizer.h>
+#include <cv_bridge/cv_bridge.hpp>
 
 extern "C" {
 #include <apriltag.h>
@@ -26,18 +32,24 @@ public:
         //Declare and load parameters
         this->declare_parameter("verbose", false);
         this->declare_parameter("display", false);
+        this->declare_parameter("input_mode", "pointcloud");  // "pointcloud" or "rgbd"
         this->declare_parameter("cloud_topic", "/camera/camera/depth/color/points");
+        this->declare_parameter("image_topic", "/camera/color/image_raw");
+        this->declare_parameter("depth_topic", "/camera/aligned_depth_to_color/image_raw");
+        this->declare_parameter("camera_info_topic", "/camera/aligned_depth_to_color/camera_info");
+        this->declare_parameter("depth_scale", 0.001);  // depth units to meters
         this->declare_parameter("publish_tf", false);
         this->declare_parameter("tag_frame_prefix", "apriltag");
         this->declare_parameter("publishing_frame", "");
         this->declare_parameter("transform_timeout", 0.1);
         is_verbose_ = this->get_parameter("verbose").as_bool();
         is_display_ = this->get_parameter("display").as_bool();
-        std::string cloud_topic = this->get_parameter("cloud_topic").as_string();
+        input_mode_ = this->get_parameter("input_mode").as_string();
         publish_tf_ = this->get_parameter("publish_tf").as_bool();
         tag_frame_prefix_ = this->get_parameter("tag_frame_prefix").as_string();
         publishing_frame_ = this->get_parameter("publishing_frame").as_string();
         transform_timeout_ = this->get_parameter("transform_timeout").as_double();
+        depth_scale_ = this->get_parameter("depth_scale").as_double();
 
         //Initialize AprilTag detector
         tagFamily_ = tag36h11_create();
@@ -77,16 +89,45 @@ public:
             }
         }
 
-        //Subscribe to colored point cloud only
+        //Setup subscriptions based on input mode
         rmw_qos_profile_t qos_profile = rmw_qos_profile_default;
         qos_profile.depth = 10;
-        subCloud_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-            cloud_topic,
-            rclcpp::QoS(rclcpp::QoSInitialization::from_rmw(qos_profile)),
-            std::bind(&AprilTagNode::callback, this, std::placeholders::_1));
 
-        RCLCPP_INFO(this->get_logger(), "AprilTag detector initialized. Subscribing to:");
-        RCLCPP_INFO(this->get_logger(), "  PointCloud: %s", cloud_topic.c_str());
+        if (input_mode_ == "rgbd") {
+            std::string image_topic = this->get_parameter("image_topic").as_string();
+            std::string depth_topic = this->get_parameter("depth_topic").as_string();
+            std::string camera_info_topic = this->get_parameter("camera_info_topic").as_string();
+
+            // Camera info subscription (async, cached)
+            subCameraInfo_ = this->create_subscription<sensor_msgs::msg::CameraInfo>(
+                camera_info_topic,
+                rclcpp::QoS(rclcpp::QoSInitialization::from_rmw(qos_profile)),
+                std::bind(&AprilTagNode::cameraInfoCallback, this, std::placeholders::_1));
+
+            // Synchronized RGB + Depth
+            subImage_ = std::make_shared<message_filters::Subscriber<sensor_msgs::msg::Image>>(
+                this, image_topic, rmw_qos_profile_default);
+            subDepth_ = std::make_shared<message_filters::Subscriber<sensor_msgs::msg::Image>>(
+                this, depth_topic, rmw_qos_profile_default);
+            sync_ = std::make_shared<Sync>(SyncPolicy(10), *subImage_, *subDepth_);
+            sync_->registerCallback(
+                std::bind(&AprilTagNode::rgbdCallback, this,
+                    std::placeholders::_1, std::placeholders::_2));
+
+            RCLCPP_INFO(this->get_logger(), "AprilTag detector initialized in RGBD mode. Subscribing to:");
+            RCLCPP_INFO(this->get_logger(), "  Image: %s", image_topic.c_str());
+            RCLCPP_INFO(this->get_logger(), "  Depth: %s", depth_topic.c_str());
+            RCLCPP_INFO(this->get_logger(), "  CameraInfo: %s", camera_info_topic.c_str());
+        } else {
+            std::string cloud_topic = this->get_parameter("cloud_topic").as_string();
+            subCloud_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+                cloud_topic,
+                rclcpp::QoS(rclcpp::QoSInitialization::from_rmw(qos_profile)),
+                std::bind(&AprilTagNode::pointcloudCallback, this, std::placeholders::_1));
+
+            RCLCPP_INFO(this->get_logger(), "AprilTag detector initialized in PointCloud mode. Subscribing to:");
+            RCLCPP_INFO(this->get_logger(), "  PointCloud: %s", cloud_topic.c_str());
+        }
 
         timeProcessLoop_ = std::chrono::high_resolution_clock::now();
     }
@@ -111,112 +152,17 @@ private:
         Eigen::Quaterniond orientation;
     };
 
-    void callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& cloudMsg)
+    // ---- Shared detection and pose pipeline ----
+
+    void processDetections(
+        const cv::Mat& matColorGray,
+        cv::Mat& matColorBGR,
+        const std_msgs::msg::Header& header,
+        std::function<Eigen::Vector3d(int, int)> getPoint,
+        std::function<bool(const Eigen::Vector3d&)> isValid)
     {
-        frameIndex_++;
-        auto timeFrameProcess = std::chrono::high_resolution_clock::now();
-
-        //Validate PointCloud2 is organized
-        int width = cloudMsg->width;
-        int height = cloudMsg->height;
-        if (height <= 1) {
-            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                "Received unorganized point cloud (height=%d). "
-                "An organized colored point cloud is required.", height);
-            return;
-        }
-
-        //Find field offsets
-        int offset_x = -1, offset_y = -1, offset_z = -1, offset_rgb = -1;
-        for (const auto& field : cloudMsg->fields) {
-            if (field.name == "x") offset_x = field.offset;
-            else if (field.name == "y") offset_y = field.offset;
-            else if (field.name == "z") offset_z = field.offset;
-            else if (field.name == "rgb") offset_rgb = field.offset;
-        }
-        if (offset_x < 0 || offset_y < 0 || offset_z < 0) {
-            RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                "PointCloud2 missing x/y/z fields");
-            return;
-        }
-        if (offset_rgb < 0) {
-            RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                "PointCloud2 missing rgb field. Use a colored point cloud topic.");
-            return;
-        }
-
-        uint32_t point_step = cloudMsg->point_step;
-        uint32_t row_step = cloudMsg->row_step;
-        const uint8_t* cloudData = cloudMsg->data.data();
-
-        //Extract grayscale image from point cloud RGB data.
-        //Pixels with invalid depth (NaN/zero z) may have garbage RGB,
-        //which creates black holes that break AprilTag quad detection.
-        //We mark those pixels and inpaint them from valid neighbors.
-        cv::Mat matColorGray(height, width, CV_8UC1);
-        cv::Mat invalidMask(height, width, CV_8UC1, cv::Scalar(0));
-        cv::Mat matColorBGR;
-        if (is_display_) {
-            matColorBGR = cv::Mat(height, width, CV_8UC3);
-        }
-        int invalidNan = 0, invalidZero = 0, invalidNearZero = 0;
-        for (int py = 0; py < height; py++) {
-            const uint8_t* rowPtr = cloudData + py * row_step;
-            for (int px = 0; px < width; px++) {
-                const uint8_t* ptPtr = rowPtr + px * point_step;
-                float z = *reinterpret_cast<const float*>(ptPtr + offset_z);
-                const uint8_t* rgbPtr = ptPtr + offset_rgb;
-                uint8_t b = rgbPtr[0];
-                uint8_t g = rgbPtr[1];
-                uint8_t r = rgbPtr[2];
-                if (!std::isfinite(z) || z < 1e-3) {
-                    if (!std::isfinite(z)) invalidNan++;
-                    else if (z == 0.0f) invalidZero++;
-                    else invalidNearZero++;
-                    matColorGray.at<uint8_t>(py, px) = 0;
-                    invalidMask.at<uint8_t>(py, px) = 255;
-                    if (is_display_) {
-                        matColorBGR.at<cv::Vec3b>(py, px) = cv::Vec3b(0, 0, 0);
-                    }
-                } else {
-                    matColorGray.at<uint8_t>(py, px) =
-                        static_cast<uint8_t>(0.299 * r + 0.587 * g + 0.114 * b);
-                    if (is_display_) {
-                        matColorBGR.at<cv::Vec3b>(py, px) = cv::Vec3b(b, g, r);
-                    }
-                }
-            }
-        }
-        int totalInvalid = invalidNan + invalidZero + invalidNearZero;
-        int totalPixels = width * height;
-        //Inpaint invalid pixels so depth holes don't corrupt tag detection
-        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-            "Invalid pixels: %d/%d (%.1f%%) — NaN: %d, zero: %d, near-zero: %d",
-            totalInvalid, totalPixels,
-            100.0 * totalInvalid / totalPixels,
-            invalidNan, invalidZero, invalidNearZero);
-
-        if (totalInvalid > 0) {
-            cv::inpaint(matColorGray, invalidMask, matColorGray, 3, cv::INPAINT_TELEA);
-            if (is_display_) {
-                cv::inpaint(matColorBGR, invalidMask, matColorBGR, 3, cv::INPAINT_TELEA);
-            }
-        }
-
-        //Helper: look up 3D point at pixel (px, py)
-        auto getPoint = [&](int px, int py) -> Eigen::Vector3d {
-            const uint8_t* ptr = cloudData + py * row_step + px * point_step;
-            float x = *reinterpret_cast<const float*>(ptr + offset_x);
-            float y = *reinterpret_cast<const float*>(ptr + offset_y);
-            float z = *reinterpret_cast<const float*>(ptr + offset_z);
-            return Eigen::Vector3d(x, y, z);
-        };
-
-        //Helper: check if a 3D point is valid
-        auto isValid = [](const Eigen::Vector3d& p) -> bool {
-            return std::isfinite(p.x()) && std::isfinite(p.y()) &&
-                   std::isfinite(p.z()) && p.z() > 1e-3;
-        };
+        int width = matColorGray.cols;
+        int height = matColorGray.rows;
 
         //Run AprilTag detection
         auto timeDetectionBegin = std::chrono::high_resolution_clock::now();
@@ -224,13 +170,13 @@ private:
             .width = matColorGray.cols,
             .height = matColorGray.rows,
             .stride = matColorGray.cols,
-            .buf = matColorGray.data
+            .buf = const_cast<uint8_t*>(matColorGray.data)
         };
         zarray_t* detections = apriltag_detector_detect(tagDetector_, &image);
         auto timeDetectionEnd = std::chrono::high_resolution_clock::now();
 
         //Determine the frame for publishing
-        std::string camera_frame = cloudMsg->header.frame_id;
+        std::string camera_frame = header.frame_id;
         Eigen::Quaterniond q_pc = Eigen::Quaterniond::Identity();
         Eigen::Vector3d t_pc = Eigen::Vector3d::Zero();
         bool usePublishingFrame = !publishing_frame_.empty() && tfBuffer_;
@@ -292,7 +238,7 @@ private:
                 continue;
             }
 
-            //Look up 3D positions from point cloud (camera frame)
+            //Look up 3D positions
             Eigen::Vector3d pos0 = getPoint(uv0.x(), uv0.y());
             Eigen::Vector3d pos1 = getPoint(uv1.x(), uv1.y());
             Eigen::Vector3d pos2 = getPoint(uv2.x(), uv2.y());
@@ -337,7 +283,7 @@ private:
 
             //Publish tag pose message
             geometry_msgs::msg::PoseStamped msg;
-            msg.header.stamp = cloudMsg->header.stamp;
+            msg.header.stamp = header.stamp;
             msg.header.frame_id = pose_frame_id;
             msg.pose.position.x = posTag.x();
             msg.pose.position.y = posTag.y();
@@ -353,11 +299,11 @@ private:
 
         //Publish per-tag TF frames
         if (publish_tf_ && !camTagPoses.empty()) {
-            publishTagTransforms(cloudMsg->header, camTagPoses);
+            publishTagTransforms(header, camTagPoses);
         }
 
         //Draw detected tags on color frame
-        if (is_display_) {
+        if (is_display_ && !matColorBGR.empty()) {
             for (int i = 0; i < zarray_size(detections); i++) {
                 apriltag_detection_t* det;
                 zarray_get(detections, i, &det);
@@ -425,14 +371,239 @@ private:
                        timeDetectionEnd - timeDetectionBegin)).count() << "ms"
                 << " duration="
                 << (std::chrono::duration<double, std::milli>(
-                       timeNow - timeFrameProcess)).count() << "ms"
-                << " period="
-                << (std::chrono::duration<double, std::milli>(
                        timeNow - timeProcessLoop_)).count() << "ms"
                 << std::endl;
         }
         timeProcessLoop_ = timeNow;
     }
+
+    // ---- PointCloud mode callback ----
+
+    void pointcloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& cloudMsg)
+    {
+        frameIndex_++;
+
+        //Validate PointCloud2 is organized
+        int width = cloudMsg->width;
+        int height = cloudMsg->height;
+        if (height <= 1) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                "Received unorganized point cloud (height=%d). "
+                "An organized colored point cloud is required.", height);
+            return;
+        }
+
+        //Find field offsets
+        int offset_x = -1, offset_y = -1, offset_z = -1, offset_rgb = -1;
+        for (const auto& field : cloudMsg->fields) {
+            if (field.name == "x") offset_x = field.offset;
+            else if (field.name == "y") offset_y = field.offset;
+            else if (field.name == "z") offset_z = field.offset;
+            else if (field.name == "rgb") offset_rgb = field.offset;
+        }
+        if (offset_x < 0 || offset_y < 0 || offset_z < 0) {
+            RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                "PointCloud2 missing x/y/z fields");
+            return;
+        }
+        if (offset_rgb < 0) {
+            RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                "PointCloud2 missing rgb field. Use a colored point cloud topic.");
+            return;
+        }
+
+        uint32_t point_step = cloudMsg->point_step;
+        uint32_t row_step = cloudMsg->row_step;
+        const uint8_t* cloudData = cloudMsg->data.data();
+
+        //Extract grayscale image from point cloud RGB data
+        cv::Mat matColorGray(height, width, CV_8UC1);
+        cv::Mat invalidMask(height, width, CV_8UC1, cv::Scalar(0));
+        cv::Mat matColorBGR;
+        if (is_display_) {
+            matColorBGR = cv::Mat(height, width, CV_8UC3);
+        }
+        int invalidNan = 0, invalidZero = 0, invalidNearZero = 0;
+        for (int py = 0; py < height; py++) {
+            const uint8_t* rowPtr = cloudData + py * row_step;
+            for (int px = 0; px < width; px++) {
+                const uint8_t* ptPtr = rowPtr + px * point_step;
+                float z = *reinterpret_cast<const float*>(ptPtr + offset_z);
+                const uint8_t* rgbPtr = ptPtr + offset_rgb;
+                uint8_t b = rgbPtr[0];
+                uint8_t g = rgbPtr[1];
+                uint8_t r = rgbPtr[2];
+                if (!std::isfinite(z) || z < 1e-3) {
+                    if (!std::isfinite(z)) invalidNan++;
+                    else if (z == 0.0f) invalidZero++;
+                    else invalidNearZero++;
+                    matColorGray.at<uint8_t>(py, px) = 0;
+                    invalidMask.at<uint8_t>(py, px) = 255;
+                    if (is_display_) {
+                        matColorBGR.at<cv::Vec3b>(py, px) = cv::Vec3b(0, 0, 0);
+                    }
+                } else {
+                    matColorGray.at<uint8_t>(py, px) =
+                        static_cast<uint8_t>(0.299 * r + 0.587 * g + 0.114 * b);
+                    if (is_display_) {
+                        matColorBGR.at<cv::Vec3b>(py, px) = cv::Vec3b(b, g, r);
+                    }
+                }
+            }
+        }
+        int totalInvalid = invalidNan + invalidZero + invalidNearZero;
+        int totalPixels = width * height;
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+            "Invalid pixels: %d/%d (%.1f%%) — NaN: %d, zero: %d, near-zero: %d",
+            totalInvalid, totalPixels,
+            100.0 * totalInvalid / totalPixels,
+            invalidNan, invalidZero, invalidNearZero);
+
+        if (totalInvalid > 0) {
+            cv::inpaint(matColorGray, invalidMask, matColorGray, 3, cv::INPAINT_TELEA);
+            if (is_display_) {
+                cv::inpaint(matColorBGR, invalidMask, matColorBGR, 3, cv::INPAINT_TELEA);
+            }
+        }
+
+        //3D point lookup from point cloud
+        auto getPoint = [&](int px, int py) -> Eigen::Vector3d {
+            const uint8_t* ptr = cloudData + py * row_step + px * point_step;
+            float x = *reinterpret_cast<const float*>(ptr + offset_x);
+            float y = *reinterpret_cast<const float*>(ptr + offset_y);
+            float z = *reinterpret_cast<const float*>(ptr + offset_z);
+            return Eigen::Vector3d(x, y, z);
+        };
+
+        auto isValid = [](const Eigen::Vector3d& p) -> bool {
+            return std::isfinite(p.x()) && std::isfinite(p.y()) &&
+                   std::isfinite(p.z()) && p.z() > 1e-3;
+        };
+
+        processDetections(matColorGray, matColorBGR, cloudMsg->header, getPoint, isValid);
+    }
+
+    // ---- RGBD mode callback ----
+
+    void cameraInfoCallback(const sensor_msgs::msg::CameraInfo::ConstSharedPtr& msg)
+    {
+        RCLCPP_INFO_ONCE(this->get_logger(), "Received first CameraInfo message");
+        cameraInfo_ = msg;
+    }
+
+    void rgbdCallback(
+        const sensor_msgs::msg::Image::ConstSharedPtr& imageMsg,
+        const sensor_msgs::msg::Image::ConstSharedPtr& depthMsg)
+    {
+        RCLCPP_INFO_ONCE(this->get_logger(),
+            "Received first synced RGB+Depth pair: RGB %dx%d (%s), Depth %dx%d (%s)",
+            imageMsg->width, imageMsg->height, imageMsg->encoding.c_str(),
+            depthMsg->width, depthMsg->height, depthMsg->encoding.c_str());
+        frameIndex_++;
+
+        if (!cameraInfo_) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                "No CameraInfo received yet, skipping frame");
+            return;
+        }
+
+        // Convert RGB image to grayscale
+        cv::Mat matColor;
+        try {
+            matColor = cv_bridge::toCvShare(imageMsg)->image;
+        } catch (const cv_bridge::Exception& e) {
+            RCLCPP_ERROR(this->get_logger(), "cv_bridge RGB error: %s", e.what());
+            return;
+        }
+
+        cv::Mat matColorGray;
+        if (matColor.channels() == 1) {
+            matColorGray = matColor;
+        } else {
+            cv::cvtColor(matColor, matColorGray, cv::COLOR_BGR2GRAY);
+        }
+
+        // Convert depth image
+        cv::Mat depthRaw;
+        try {
+            depthRaw = cv_bridge::toCvShare(depthMsg)->image;
+        } catch (const cv_bridge::Exception& e) {
+            RCLCPP_ERROR(this->get_logger(), "cv_bridge depth error: %s", e.what());
+            return;
+        }
+
+        int width = matColorGray.cols;
+        int height = matColorGray.rows;
+
+        // Convert depth to float meters
+        cv::Mat depthMeters;
+        if (depthRaw.type() == CV_16UC1) {
+            depthRaw.convertTo(depthMeters, CV_32FC1, depth_scale_);
+        } else if (depthRaw.type() == CV_32FC1) {
+            depthMeters = depthRaw;
+        } else {
+            RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                "Unsupported depth format: %d", depthRaw.type());
+            return;
+        }
+
+        // Build invalid mask and inpaint grayscale for detection
+        cv::Mat invalidMask(height, width, CV_8UC1, cv::Scalar(0));
+        for (int py = 0; py < height; py++) {
+            for (int px = 0; px < width; px++) {
+                float z = depthMeters.at<float>(py, px);
+                if (!std::isfinite(z) || z < 1e-3) {
+                    invalidMask.at<uint8_t>(py, px) = 255;
+                    matColorGray.at<uint8_t>(py, px) = 0;
+                }
+            }
+        }
+
+        int totalInvalid = cv::countNonZero(invalidMask);
+        int totalPixels = width * height;
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+            "Invalid depth pixels: %d/%d (%.1f%%)",
+            totalInvalid, totalPixels, 100.0 * totalInvalid / totalPixels);
+
+        if (totalInvalid > 0) {
+            cv::inpaint(matColorGray, invalidMask, matColorGray, 3, cv::INPAINT_TELEA);
+        }
+
+        cv::Mat matColorBGR;
+        if (is_display_) {
+            if (matColor.channels() == 1) {
+                cv::cvtColor(matColor, matColorBGR, cv::COLOR_GRAY2BGR);
+            } else {
+                matColorBGR = matColor.clone();
+            }
+            if (totalInvalid > 0) {
+                cv::inpaint(matColorBGR, invalidMask, matColorBGR, 3, cv::INPAINT_TELEA);
+            }
+        }
+
+        // Camera intrinsics from CameraInfo
+        double fx = cameraInfo_->k[0];
+        double fy = cameraInfo_->k[4];
+        double cx = cameraInfo_->k[2];
+        double cy = cameraInfo_->k[5];
+
+        // 3D point lookup using pinhole projection
+        auto getPoint = [&](int px, int py) -> Eigen::Vector3d {
+            float z = depthMeters.at<float>(py, px);
+            double x = (px - cx) * z / fx;
+            double y = (py - cy) * z / fy;
+            return Eigen::Vector3d(x, y, z);
+        };
+
+        auto isValid = [](const Eigen::Vector3d& p) -> bool {
+            return std::isfinite(p.x()) && std::isfinite(p.y()) &&
+                   std::isfinite(p.z()) && p.z() > 1e-3;
+        };
+
+        processDetections(matColorGray, matColorBGR, imageMsg->header, getPoint, isValid);
+    }
+
+    // ---- TF publishing ----
 
     void publishTagTransforms(
         const std_msgs::msg::Header& header,
@@ -498,8 +669,22 @@ private:
         }
     }
 
-    //Subscriber
+    // ---- Members ----
+
+    //Subscribers
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr subCloud_;
+    rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr subCameraInfo_;
+    std::shared_ptr<message_filters::Subscriber<sensor_msgs::msg::Image>> subImage_;
+    std::shared_ptr<message_filters::Subscriber<sensor_msgs::msg::Image>> subDepth_;
+
+    //RGBD synchronizer
+    using SyncPolicy = message_filters::sync_policies::ApproximateTime<
+        sensor_msgs::msg::Image, sensor_msgs::msg::Image>;
+    using Sync = message_filters::Synchronizer<SyncPolicy>;
+    std::shared_ptr<Sync> sync_;
+
+    //Cached camera info
+    sensor_msgs::msg::CameraInfo::ConstSharedPtr cameraInfo_;
 
     //Publishers indexed by tag id
     std::map<int, rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr> containerPub_;
@@ -516,12 +701,14 @@ private:
     std::shared_ptr<tf2_ros::TransformListener> tfListener_;
 
     //Parameters
+    std::string input_mode_;
     bool is_verbose_;
     bool is_display_;
     bool publish_tf_;
     std::string tag_frame_prefix_;
     std::string publishing_frame_;
     double transform_timeout_;
+    double depth_scale_;
 
     //State
     uint64_t frameIndex_;

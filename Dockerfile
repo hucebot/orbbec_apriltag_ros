@@ -42,6 +42,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 #Install CycloneDDS
 RUN apt-get update && apt-get install -y ros-${ROS_DISTRO}-rmw-cyclonedds-cpp
 
+#Install ROS2 packages needed for apriltag_pose
+RUN apt-get update && apt-get install -y \
+    ros-${ROS_DISTRO}-vision-opencv \
+    ros-${ROS_DISTRO}-cv-bridge \
+    ros-${ROS_DISTRO}-message-filters \
+    ros-${ROS_DISTRO}-sensor-msgs \
+    ros-${ROS_DISTRO}-geometry-msgs \
+    ros-${ROS_DISTRO}-std-msgs \
+    ros-${ROS_DISTRO}-tf2-geometry-msgs \
+    ros-${ROS_DISTRO}-tf2 \
+    ros-${ROS_DISTRO}-tf2-ros
+
 #Install OpenCV
 RUN apt-get update && apt-get install -y libopencv-dev libopencv-core-dev opencv-data
 
