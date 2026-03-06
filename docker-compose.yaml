@@ -1,0 +1,21 @@
+services:
+  apriltag_pose:
+    image: apriltag_pose:latest
+    build:
+      context: .
+      dockerfile: .ci/Dockerfile
+      target: dep
+    container_name: apriltag_deploy
+    privileged: true
+    network_mode: host
+    restart: always
+    devices:
+      - /dev/bus/usb:/dev/bus/usb
+    environment:
+      - DISPLAY=${DISPLAY}
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix
+    deploy:
+      resources:
+        reservations:
+          devices: [{driver: nvidia, count: all, capabilities: [gpu]}]
