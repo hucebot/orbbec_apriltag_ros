@@ -45,4 +45,4 @@ ENV CYCLONEDDS_URI=/etc/ros2/cyclonedds.xml
 ENV ROS_DOMAIN_ID=1
 
 # Default launch command
-CMD ros2 launch apriltag_pose apriltag_pose.launch.py image_topic:=/tiago_head_camera_down/color/image_raw cloud_topic:=/tiago_head_camera_down/depth_registered/points display:=true verbose:=true
+CMD ros2 launch apriltag_pose apriltag_pose.launch.py image_topic:=/tiago_head_camera_down/color/image_raw cloud_topic:=/tiago_head_camera_down/depth_registered/points display:=true verbose:=true frame_id:=tiago_head_camera_down_color_optical_frame
