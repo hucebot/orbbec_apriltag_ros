@@ -4,6 +4,8 @@
 #include <cstring>
 #include <chrono>
 #include <functional>
+#include <random>
+#include <algorithm>
 #include <Eigen/Dense>
 #include <opencv2/opencv.hpp>
 #include <rclcpp/rclcpp.hpp>
@@ -43,7 +45,7 @@ public:
         this->declare_parameter("tag_frame_prefix", "apriltag");
         this->declare_parameter("publishing_frame", "");
         this->declare_parameter("transform_timeout", 0.1);
-        this->declare_parameter("min_decision_margin", 30.0);
+        this->declare_parameter("min_decision_margin", 0.0);
         this->declare_parameter("debug", false);
         is_verbose_ = this->get_parameter("verbose").as_bool();
         is_display_ = this->get_parameter("display").as_bool();
@@ -100,6 +102,12 @@ public:
                 "apriltag_pose/debug/points", 10);
             debugSegPub_ = this->create_publisher<sensor_msgs::msg::Image>(
                 "apriltag_pose/debug/segmentation", 10);
+            debugGrayPub_ = this->create_publisher<sensor_msgs::msg::Image>(
+                "apriltag_pose/debug/grayscale", 10);
+            debugDetectionPub_ = this->create_publisher<sensor_msgs::msg::Image>(
+                "apriltag_pose/debug/detections", 10);
+            debugDepthCloudPub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
+                "apriltag_pose/debug/depth_cloud", 10);
             RCLCPP_INFO(this->get_logger(), "Debug publishers enabled");
         }
 
@@ -168,6 +176,403 @@ private:
 
     // ---- Shared detection and pose pipeline ----
 
+    // ---- RANSAC plane fitting ----
+
+    struct PlaneResult {
+        bool success;
+        Eigen::Vector3d normal;
+        double d;
+        int inliers;
+        double inlierRatio;
+    };
+
+    PlaneResult fitPlaneRANSAC(
+        const std::vector<Eigen::Vector3d>& points,
+        int iterations = 100,
+        double threshold = 0.005)
+    {
+        PlaneResult result{false, Eigen::Vector3d(0, 0, 1), 0.0, 0, 0.0};
+        std::mt19937 rng(42);
+
+        for (int iter = 0; iter < iterations; iter++) {
+            std::uniform_int_distribution<int> dist(0, points.size() - 1);
+            int i1 = dist(rng), i2 = dist(rng), i3 = dist(rng);
+            if (i1 == i2 || i1 == i3 || i2 == i3) continue;
+
+            Eigen::Vector3d n = (points[i2] - points[i1]).cross(points[i3] - points[i1]);
+            if (n.norm() < 1e-10) continue;
+            n.normalize();
+            double d = -n.dot(points[i1]);
+
+            int inliers = 0;
+            for (const auto& pt : points) {
+                if (std::abs(n.dot(pt) + d) < threshold) inliers++;
+            }
+
+            if (inliers > result.inliers) {
+                result.inliers = inliers;
+                result.normal = n;
+                result.d = d;
+            }
+        }
+
+        result.inlierRatio = static_cast<double>(result.inliers) / points.size();
+        result.success = result.inlierRatio >= 0.5;
+
+        //Ensure normal points toward camera (negative z direction)
+        if (result.normal.z() > 0) {
+            result.normal = -result.normal;
+            result.d = -result.d;
+        }
+        return result;
+    }
+
+    // ---- Median position from plane inliers ----
+
+    Eigen::Vector3d computeMedianInlierPosition(
+        const std::vector<Eigen::Vector3d>& points,
+        const Eigen::Vector3d& normal,
+        double d,
+        double threshold)
+    {
+        std::vector<double> xs, ys, zs;
+        for (const auto& pt : points) {
+            if (std::abs(normal.dot(pt) + d) < threshold) {
+                xs.push_back(pt.x());
+                ys.push_back(pt.y());
+                zs.push_back(pt.z());
+            }
+        }
+        std::sort(xs.begin(), xs.end());
+        std::sort(ys.begin(), ys.end());
+        std::sort(zs.begin(), zs.end());
+        return Eigen::Vector3d(
+            xs[xs.size() / 2],
+            ys[ys.size() / 2],
+            zs[zs.size() / 2]);
+    }
+
+    // ---- Ray-plane intersection ----
+
+    Eigen::Vector3d rayPlaneIntersect(
+        double px, double py,
+        const Eigen::Vector3d& planeNormal, double planeD,
+        const Eigen::Vector3d& fallback,
+        std::function<Eigen::Vector3d(int, int)> getPoint,
+        std::function<bool(const Eigen::Vector3d&)> isValid)
+    {
+        Eigen::Vector3d rayDir;
+        if (cameraInfo_) {
+            double fx = cameraInfo_->k[0];
+            double fy = cameraInfo_->k[4];
+            double cx = cameraInfo_->k[2];
+            double cy = cameraInfo_->k[5];
+            rayDir = Eigen::Vector3d((px - cx) / fx, (py - cy) / fy, 1.0).normalized();
+        } else {
+            Eigen::Vector3d pt = getPoint((int)px, (int)py);
+            if (isValid(pt)) {
+                rayDir = pt.normalized();
+            } else {
+                rayDir = fallback.normalized();
+            }
+        }
+        double denom = planeNormal.dot(rayDir);
+        if (std::abs(denom) < 1e-10) return fallback;
+        double t = -planeD / denom;
+        return rayDir * t;
+    }
+
+    // ---- Compute tag orientation from plane normal and edge ----
+
+    Eigen::Quaterniond computeTagOrientation(
+        const apriltag_detection_t* det,
+        const Eigen::Vector3d& planeNormal, double planeD,
+        const Eigen::Vector3d& tagCenter,
+        std::function<Eigen::Vector3d(int, int)> getPoint,
+        std::function<bool(const Eigen::Vector3d&)> isValid)
+    {
+        Eigen::Vector3d p0 = rayPlaneIntersect(
+            det->p[0][0], det->p[0][1], planeNormal, planeD, tagCenter, getPoint, isValid);
+        Eigen::Vector3d p1 = rayPlaneIntersect(
+            det->p[1][0], det->p[1][1], planeNormal, planeD, tagCenter, getPoint, isValid);
+
+        Eigen::Vector3d edgeDir = (p1 - p0).normalized();
+        //Make edge direction orthogonal to the plane normal
+        edgeDir = (edgeDir - edgeDir.dot(planeNormal) * planeNormal).normalized();
+
+        Eigen::Vector3d vectZ_cam = edgeDir;
+        Eigen::Vector3d vectY_cam = -planeNormal.cross(vectZ_cam).normalized();
+        Eigen::Matrix3d rotCam = Eigen::Matrix3d::Identity();
+        rotCam.col(0) = -vectY_cam.cross(vectZ_cam);
+        rotCam.col(1) = -vectZ_cam;
+        rotCam.col(2) = -vectY_cam;
+        Eigen::Quaterniond q(rotCam);
+        q.normalize();
+        return q;
+    }
+
+    // ---- Collect valid 3D points inside tag quad ----
+
+    std::vector<Eigen::Vector3d> collectTagPoints(
+        const apriltag_detection_t* det,
+        int width, int height,
+        std::function<Eigen::Vector3d(int, int)> getPoint,
+        std::function<bool(const Eigen::Vector3d&)> isValid)
+    {
+        std::vector<cv::Point2f> quad = {
+            cv::Point2f(det->p[0][0], det->p[0][1]),
+            cv::Point2f(det->p[1][0], det->p[1][1]),
+            cv::Point2f(det->p[2][0], det->p[2][1]),
+            cv::Point2f(det->p[3][0], det->p[3][1]),
+        };
+        cv::Rect bbox = cv::boundingRect(quad);
+        int xmin = std::max(0, bbox.x);
+        int ymin = std::max(0, bbox.y);
+        int xmax = std::min(width - 1, bbox.x + bbox.width);
+        int ymax = std::min(height - 1, bbox.y + bbox.height);
+
+        std::vector<Eigen::Vector3d> points;
+        for (int py = ymin; py <= ymax; py++) {
+            for (int px = xmin; px <= xmax; px++) {
+                if (cv::pointPolygonTest(quad, cv::Point2f(px, py), false) >= 0) {
+                    Eigen::Vector3d pt = getPoint(px, py);
+                    if (isValid(pt)) {
+                        points.push_back(pt);
+                    }
+                }
+            }
+        }
+        return points;
+    }
+
+    // ---- Look up publishing frame transform ----
+
+    struct FrameTransform {
+        bool valid;
+        Eigen::Quaterniond rotation;
+        Eigen::Vector3d translation;
+        std::string frame_id;
+    };
+
+    FrameTransform lookupPublishingFrame(const std::string& camera_frame)
+    {
+        FrameTransform tf{false, Eigen::Quaterniond::Identity(), Eigen::Vector3d::Zero(), camera_frame};
+        if (publishing_frame_.empty() || !tfBuffer_) return tf;
+
+        try {
+            auto tfStamped = tfBuffer_->lookupTransform(
+                publishing_frame_, camera_frame,
+                tf2::TimePointZero,
+                tf2::durationFromSec(transform_timeout_));
+            tf.rotation = Eigen::Quaterniond(
+                tfStamped.transform.rotation.w,
+                tfStamped.transform.rotation.x,
+                tfStamped.transform.rotation.y,
+                tfStamped.transform.rotation.z);
+            tf.translation = Eigen::Vector3d(
+                tfStamped.transform.translation.x,
+                tfStamped.transform.translation.y,
+                tfStamped.transform.translation.z);
+            tf.frame_id = publishing_frame_;
+            tf.valid = true;
+        } catch (const tf2::TransformException& ex) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                "Could not look up transform %s -> %s: %s. Publishing in camera frame.",
+                publishing_frame_.c_str(), camera_frame.c_str(), ex.what());
+        }
+        return tf;
+    }
+
+    // ---- Publish tag pose ----
+
+    void publishTagPose(
+        const std_msgs::msg::Header& header,
+        const std::string& frame_id,
+        int tagId,
+        const Eigen::Vector3d& position,
+        const Eigen::Quaterniond& orientation)
+    {
+        if (containerPub_.count(tagId) == 0) {
+            containerPub_[tagId] = this->create_publisher<geometry_msgs::msg::PoseStamped>(
+                "apriltag_pose/pose_tag_" + std::to_string(tagId), 10);
+        }
+
+        geometry_msgs::msg::PoseStamped msg;
+        msg.header.stamp = header.stamp;
+        msg.header.frame_id = frame_id;
+        msg.pose.position.x = position.x();
+        msg.pose.position.y = position.y();
+        msg.pose.position.z = position.z();
+        msg.pose.orientation.x = orientation.x();
+        msg.pose.orientation.y = orientation.y();
+        msg.pose.orientation.z = orientation.z();
+        msg.pose.orientation.w = orientation.w();
+        containerPub_[tagId]->publish(msg);
+    }
+
+    // ---- Draw detections on image ----
+
+    void drawDetections(
+        cv::Mat& matColorBGR,
+        zarray_t* detections,
+        const std::vector<bool>& is_pose_detected)
+    {
+        for (int i = 0; i < zarray_size(detections); i++) {
+            apriltag_detection_t* det;
+            zarray_get(detections, i, &det);
+
+            //Draw plane points if tag pose is detected
+            if (is_pose_detected.at(i)) {
+                Eigen::Matrix3d homography;
+                homography(0, 0) = det->H->data[0];
+                homography(0, 1) = det->H->data[1];
+                homography(0, 2) = det->H->data[2];
+                homography(1, 0) = det->H->data[3];
+                homography(1, 1) = det->H->data[4];
+                homography(1, 2) = det->H->data[5];
+                homography(2, 0) = det->H->data[6];
+                homography(2, 1) = det->H->data[7];
+                homography(2, 2) = det->H->data[8];
+                for (double x = -1.0; x <= 1.0; x += 1.0 / 4.0) {
+                    for (double y = -1.0; y <= 1.0; y += 1.0 / 4.0) {
+                        Eigen::Vector3d uv1(x, y, 1.0);
+                        Eigen::Vector3d uv2 = homography * uv1;
+                        uv2 = uv2 * (1.0 / uv2.z());
+                        cv::circle(matColorBGR,
+                            cv::Point((int)uv2.x(), (int)uv2.y()),
+                            3, cv::Scalar(255, 0, 255), -1);
+                    }
+                }
+            }
+
+            cv::circle(matColorBGR, cv::Point(det->p[0][0], det->p[0][1]),
+                5, cv::Scalar(0, 0, 255), -1);
+            cv::circle(matColorBGR, cv::Point(det->p[1][0], det->p[1][1]),
+                5, cv::Scalar(0, 255, 0), -1);
+            cv::circle(matColorBGR, cv::Point(det->p[2][0], det->p[2][1]),
+                5, cv::Scalar(255, 0, 0), -1);
+            cv::circle(matColorBGR, cv::Point(det->p[3][0], det->p[3][1]),
+                5, cv::Scalar(255, 255, 0), -1);
+            cv::circle(matColorBGR, cv::Point(det->c[0], det->c[1]),
+                5, cv::Scalar(0, 255, 255), -1);
+        }
+    }
+
+    // ---- Publish debug visualizations ----
+
+    void publishDebugViz(
+        zarray_t* detections,
+        const std::vector<bool>& is_pose_detected,
+        const std_msgs::msg::Header& header,
+        const std::string& camera_frame,
+        const cv::Mat& matColorGray,
+        cv::Mat& matColorBGR,
+        int width, int height,
+        std::function<Eigen::Vector3d(int, int)> getPoint,
+        std::function<bool(const Eigen::Vector3d&)> isValid)
+    {
+        //Debug point cloud and segmentation
+        if (is_debug_ && zarray_size(detections) > 0) {
+            static const uint8_t tagColors[][3] = {
+                {255, 0, 0}, {0, 255, 0}, {0, 0, 255},
+                {255, 255, 0}, {0, 255, 255}, {255, 0, 255},
+            };
+            static const int nColors = 6;
+
+            cv::Mat segMask(height, width, CV_8UC1, cv::Scalar(0));
+            std::vector<float> cloudPoints;
+
+            for (int i = 0; i < zarray_size(detections); i++) {
+                if (!is_pose_detected.at(i)) continue;
+
+                apriltag_detection_t* det;
+                zarray_get(detections, i, &det);
+
+                std::vector<cv::Point> quad(4);
+                for (int j = 0; j < 4; j++)
+                    quad[j] = cv::Point((int)det->p[j][0], (int)det->p[j][1]);
+
+                cv::fillConvexPoly(segMask, quad, cv::Scalar(255));
+
+                cv::Rect bbox = cv::boundingRect(quad);
+                int xmin = std::max(0, bbox.x);
+                int ymin = std::max(0, bbox.y);
+                int xmax = std::min(width - 1, bbox.x + bbox.width);
+                int ymax = std::min(height - 1, bbox.y + bbox.height);
+
+                const uint8_t* color = tagColors[i % nColors];
+                uint32_t rgbPacked = ((uint32_t)color[0] << 16) |
+                                     ((uint32_t)color[1] << 8) |
+                                     ((uint32_t)color[2]);
+                float rgbFloat;
+                std::memcpy(&rgbFloat, &rgbPacked, sizeof(float));
+
+                for (int py = ymin; py <= ymax; py++) {
+                    for (int px = xmin; px <= xmax; px++) {
+                        if (cv::pointPolygonTest(quad, cv::Point2f(px, py), false) >= 0) {
+                            Eigen::Vector3d pt = getPoint(px, py);
+                            if (isValid(pt)) {
+                                cloudPoints.push_back(pt.x());
+                                cloudPoints.push_back(pt.y());
+                                cloudPoints.push_back(pt.z());
+                                cloudPoints.push_back(rgbFloat);
+                            }
+                        }
+                    }
+                }
+            }
+
+            auto segMsg = cv_bridge::CvImage(header, "mono8", segMask).toImageMsg();
+            debugSegPub_->publish(*segMsg);
+
+            sensor_msgs::msg::PointCloud2 cloudMsg;
+            cloudMsg.header = header;
+            cloudMsg.header.frame_id = camera_frame;
+            int numPoints = cloudPoints.size() / 4;
+            cloudMsg.height = 1;
+            cloudMsg.width = numPoints;
+            cloudMsg.is_dense = true;
+            cloudMsg.is_bigendian = false;
+            cloudMsg.point_step = 16;
+            cloudMsg.row_step = cloudMsg.point_step * numPoints;
+
+            sensor_msgs::msg::PointField fx, fy, fz, frgb;
+            fx.name = "x"; fx.offset = 0; fx.datatype = sensor_msgs::msg::PointField::FLOAT32; fx.count = 1;
+            fy.name = "y"; fy.offset = 4; fy.datatype = sensor_msgs::msg::PointField::FLOAT32; fy.count = 1;
+            fz.name = "z"; fz.offset = 8; fz.datatype = sensor_msgs::msg::PointField::FLOAT32; fz.count = 1;
+            frgb.name = "rgb"; frgb.offset = 12; frgb.datatype = sensor_msgs::msg::PointField::FLOAT32; frgb.count = 1;
+            cloudMsg.fields = {fx, fy, fz, frgb};
+
+            cloudMsg.data.resize(cloudPoints.size() * sizeof(float));
+            std::memcpy(cloudMsg.data.data(), cloudPoints.data(), cloudMsg.data.size());
+            debugCloudPub_->publish(cloudMsg);
+        }
+
+        //Grayscale image
+        if (is_debug_ && debugGrayPub_) {
+            auto grayMsg = cv_bridge::CvImage(header, "mono8", matColorGray).toImageMsg();
+            debugGrayPub_->publish(*grayMsg);
+        }
+
+        //Detection overlay
+        bool shouldDraw = is_display_ || (is_debug_ && debugDetectionPub_);
+        if (shouldDraw && !matColorBGR.empty()) {
+            drawDetections(matColorBGR, detections, is_pose_detected);
+
+            if (is_display_) {
+                cv::imshow("color", matColorBGR);
+            }
+            if (is_debug_ && debugDetectionPub_) {
+                cv::Mat matDetectionRGB;
+                cv::cvtColor(matColorBGR, matDetectionRGB, cv::COLOR_BGR2RGB);
+                auto detMsg = cv_bridge::CvImage(header, "rgb8", matDetectionRGB).toImageMsg();
+                debugDetectionPub_->publish(*detMsg);
+            }
+        }
+    }
+
+    // ---- Main detection pipeline ----
+
     void processDetections(
         const cv::Mat& matColorGray,
         cv::Mat& matColorBGR,
@@ -177,49 +582,23 @@ private:
     {
         int width = matColorGray.cols;
         int height = matColorGray.rows;
+        std::string camera_frame = header.frame_id;
+        const double ransacThresh = 0.005;
 
         //Run AprilTag detection
         auto timeDetectionBegin = std::chrono::high_resolution_clock::now();
         image_u8_t image = {
             .width = matColorGray.cols,
             .height = matColorGray.rows,
-            .stride = matColorGray.cols,
+            .stride = static_cast<int>(matColorGray.step),
             .buf = const_cast<uint8_t*>(matColorGray.data)
         };
         zarray_t* detections = apriltag_detector_detect(tagDetector_, &image);
         auto timeDetectionEnd = std::chrono::high_resolution_clock::now();
 
-        //Determine the frame for publishing
-        std::string camera_frame = header.frame_id;
-        Eigen::Quaterniond q_pc = Eigen::Quaterniond::Identity();
-        Eigen::Vector3d t_pc = Eigen::Vector3d::Zero();
-        bool usePublishingFrame = !publishing_frame_.empty() && tfBuffer_;
-        std::string pose_frame_id = camera_frame;
-
-        if (usePublishingFrame) {
-            geometry_msgs::msg::TransformStamped tfStamped;
-            try {
-                tfStamped = tfBuffer_->lookupTransform(
-                    publishing_frame_, camera_frame,
-                    tf2::TimePointZero,
-                    tf2::durationFromSec(transform_timeout_));
-                q_pc = Eigen::Quaterniond(
-                    tfStamped.transform.rotation.w,
-                    tfStamped.transform.rotation.x,
-                    tfStamped.transform.rotation.y,
-                    tfStamped.transform.rotation.z);
-                t_pc = Eigen::Vector3d(
-                    tfStamped.transform.translation.x,
-                    tfStamped.transform.translation.y,
-                    tfStamped.transform.translation.z);
-                pose_frame_id = publishing_frame_;
-            } catch (const tf2::TransformException& ex) {
-                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                    "Could not look up transform %s -> %s: %s. Publishing in camera frame.",
-                    publishing_frame_.c_str(), camera_frame.c_str(), ex.what());
-                usePublishingFrame = false;
-            }
-        }
+        //Look up publishing frame transform
+        FrameTransform frameTf = lookupPublishingFrame(camera_frame);
+        std::string pose_frame_id = frameTf.valid ? frameTf.frame_id : camera_frame;
 
         //Process each detected tag
         std::vector<bool> is_pose_detected;
@@ -239,237 +618,70 @@ private:
                 continue;
             }
 
-            //Retrieve center and corners image coordinates
-            Eigen::Vector2i uv0(det->c[0], det->c[1]);
-            Eigen::Vector2i uv1(det->p[0][0], det->p[0][1]);
-            Eigen::Vector2i uv2(det->p[1][0], det->p[1][1]);
-            Eigen::Vector2i uv3(det->p[2][0], det->p[2][1]);
-            Eigen::Vector2i uv4(det->p[3][0], det->p[3][1]);
-
             //Bounds check
-            if (
-                uv0.x() < 0 || uv0.x() >= width ||
-                uv0.y() < 0 || uv0.y() >= height ||
-                uv1.x() < 0 || uv1.x() >= width ||
-                uv1.y() < 0 || uv1.y() >= height ||
-                uv2.x() < 0 || uv2.x() >= width ||
-                uv2.y() < 0 || uv2.y() >= height ||
-                uv3.x() < 0 || uv3.x() >= width ||
-                uv3.y() < 0 || uv3.y() >= height ||
-                uv4.x() < 0 || uv4.x() >= width ||
-                uv4.y() < 0 || uv4.y() >= height
-            ) {
+            bool outOfBounds = false;
+            for (int j = 0; j < 4; j++) {
+                if (det->p[j][0] < 0 || det->p[j][0] >= width ||
+                    det->p[j][1] < 0 || det->p[j][1] >= height) {
+                    outOfBounds = true;
+                    break;
+                }
+            }
+            if (outOfBounds || det->c[0] < 0 || det->c[0] >= width ||
+                det->c[1] < 0 || det->c[1] >= height) {
                 is_pose_detected.push_back(false);
                 continue;
             }
 
-            //Look up 3D positions
-            Eigen::Vector3d pos0 = getPoint(uv0.x(), uv0.y());
-            Eigen::Vector3d pos1 = getPoint(uv1.x(), uv1.y());
-            Eigen::Vector3d pos2 = getPoint(uv2.x(), uv2.y());
-            Eigen::Vector3d pos3 = getPoint(uv3.x(), uv3.y());
-
-            //Check for invalid points (NaN or zero depth)
-            if (!isValid(pos0) || !isValid(pos1) ||
-                !isValid(pos2) || !isValid(pos3)) {
+            //Collect valid 3D points inside the tag quad
+            auto tagPoints = collectTagPoints(det, width, height, getPoint, isValid);
+            if (tagPoints.size() < 10) {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                    "Tag %d: only %zu valid depth points inside quad, need at least 10",
+                    det->id, tagPoints.size());
                 is_pose_detected.push_back(false);
                 continue;
             }
 
-            //Compute orientation in camera frame (before any coordinate transform)
-            Eigen::Vector3d vectZ_cam = (pos1 - pos2).normalized();
-            Eigen::Vector3d vectY_cam = -(pos3 - pos2).normalized();
-            Eigen::Matrix3d rotCam = Eigen::Matrix3d::Identity();
-            rotCam.col(0) = -vectY_cam.cross(vectZ_cam);
-            rotCam.col(1) = -vectZ_cam;
-            rotCam.col(2) = -vectY_cam;
-            Eigen::Quaterniond quatCam(rotCam);
-            quatCam.normalize();
+            //RANSAC plane fitting
+            PlaneResult plane = fitPlaneRANSAC(tagPoints, 100, ransacThresh);
+            if (!plane.success) {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                    "Tag %d: RANSAC plane fit poor — %d/%zu inliers (%.0f%%)",
+                    det->id, plane.inliers, tagPoints.size(), plane.inlierRatio * 100);
+                is_pose_detected.push_back(false);
+                continue;
+            }
 
-            //Store camera-frame pose for TF computation
+            //Compute tag position (median of inliers) and orientation
+            Eigen::Vector3d pos0 = computeMedianInlierPosition(
+                tagPoints, plane.normal, plane.d, ransacThresh);
+            Eigen::Quaterniond quatCam = computeTagOrientation(
+                det, plane.normal, plane.d, pos0, getPoint, isValid);
+
             camTagPoses.push_back({det->id, pos0, quatCam});
 
-            //Transform to parent frame if requested
+            //Transform to parent frame if needed
             Eigen::Vector3d posTag = pos0;
             Eigen::Quaterniond quatTag = quatCam;
-            if (usePublishingFrame) {
-                quatTag = q_pc * quatCam;
+            if (frameTf.valid) {
+                quatTag = frameTf.rotation * quatCam;
                 quatTag.normalize();
-                posTag = q_pc * pos0 + t_pc;
+                posTag = frameTf.rotation * pos0 + frameTf.translation;
             }
 
-            int indexTag = det->id;
-
-            //Initialize publisher for a newly detected tag
-            if (containerPub_.count(indexTag) == 0) {
-                containerPub_[indexTag] = this->create_publisher<geometry_msgs::msg::PoseStamped>(
-                    "apriltag_pose/pose_tag_" + std::to_string(indexTag), 10);
-            }
-
-            //Publish tag pose message
-            geometry_msgs::msg::PoseStamped msg;
-            msg.header.stamp = header.stamp;
-            msg.header.frame_id = pose_frame_id;
-            msg.pose.position.x = posTag.x();
-            msg.pose.position.y = posTag.y();
-            msg.pose.position.z = posTag.z();
-            msg.pose.orientation.x = quatTag.x();
-            msg.pose.orientation.y = quatTag.y();
-            msg.pose.orientation.z = quatTag.z();
-            msg.pose.orientation.w = quatTag.w();
-            containerPub_[indexTag]->publish(msg);
-
+            publishTagPose(header, pose_frame_id, det->id, posTag, quatTag);
             is_pose_detected.push_back(true);
         }
 
-        //Publish per-tag TF frames
+        //Publish TF frames
         if (publish_tf_ && !camTagPoses.empty()) {
             publishTagTransforms(header, camTagPoses);
         }
 
-        //Publish debug point cloud and segmentation image
-        if (is_debug_ && zarray_size(detections) > 0) {
-            //Tag colors for visualization (BGR order for cloud, but we store RGB)
-            static const uint8_t tagColors[][3] = {
-                {255, 0, 0}, {0, 255, 0}, {0, 0, 255},
-                {255, 255, 0}, {0, 255, 255}, {255, 0, 255},
-            };
-            static const int nColors = 6;
-
-            cv::Mat segMask(height, width, CV_8UC1, cv::Scalar(0));
-            std::vector<float> cloudPoints;  // x,y,z,rgb packed
-
-            for (int i = 0; i < zarray_size(detections); i++) {
-                if (!is_pose_detected.at(i)) continue;
-
-                apriltag_detection_t* det;
-                zarray_get(detections, i, &det);
-
-                //Build quad polygon from corners
-                std::vector<cv::Point> quad(4);
-                for (int j = 0; j < 4; j++) {
-                    quad[j] = cv::Point((int)det->p[j][0], (int)det->p[j][1]);
-                }
-
-                //Fill segmentation mask
-                cv::fillConvexPoly(segMask, quad, cv::Scalar(255));
-
-                //Compute bounding box of the quad
-                cv::Rect bbox = cv::boundingRect(quad);
-                int xmin = std::max(0, bbox.x);
-                int ymin = std::max(0, bbox.y);
-                int xmax = std::min(width - 1, bbox.x + bbox.width);
-                int ymax = std::min(height - 1, bbox.y + bbox.height);
-
-                //Pick color for this tag
-                const uint8_t* color = tagColors[i % nColors];
-                uint32_t rgbPacked = ((uint32_t)color[0] << 16) |
-                                     ((uint32_t)color[1] << 8) |
-                                     ((uint32_t)color[2]);
-                float rgbFloat;
-                std::memcpy(&rgbFloat, &rgbPacked, sizeof(float));
-
-                //Iterate pixels inside bounding box, test polygon membership
-                std::vector<cv::Point2f> testPts;
-                std::vector<std::pair<int,int>> validPixels;
-                for (int py = ymin; py <= ymax; py++) {
-                    for (int px = xmin; px <= xmax; px++) {
-                        if (cv::pointPolygonTest(quad, cv::Point2f(px, py), false) >= 0) {
-                            Eigen::Vector3d pt = getPoint(px, py);
-                            if (isValid(pt)) {
-                                cloudPoints.push_back(pt.x());
-                                cloudPoints.push_back(pt.y());
-                                cloudPoints.push_back(pt.z());
-                                cloudPoints.push_back(rgbFloat);
-                            }
-                        }
-                    }
-                }
-            }
-
-            //Publish segmentation image
-            std_msgs::msg::Header segHeader = header;
-            auto segMsg = cv_bridge::CvImage(segHeader, "mono8", segMask).toImageMsg();
-            debugSegPub_->publish(*segMsg);
-
-            //Publish debug point cloud
-            sensor_msgs::msg::PointCloud2 cloudMsg;
-            cloudMsg.header = header;
-            cloudMsg.header.frame_id = camera_frame;
-            int numPoints = cloudPoints.size() / 4;
-            cloudMsg.height = 1;
-            cloudMsg.width = numPoints;
-            cloudMsg.is_dense = true;
-            cloudMsg.is_bigendian = false;
-            cloudMsg.point_step = 16;  // 4 floats: x, y, z, rgb
-            cloudMsg.row_step = cloudMsg.point_step * numPoints;
-
-            sensor_msgs::msg::PointField fx, fy, fz, frgb;
-            fx.name = "x"; fx.offset = 0; fx.datatype = sensor_msgs::msg::PointField::FLOAT32; fx.count = 1;
-            fy.name = "y"; fy.offset = 4; fy.datatype = sensor_msgs::msg::PointField::FLOAT32; fy.count = 1;
-            fz.name = "z"; fz.offset = 8; fz.datatype = sensor_msgs::msg::PointField::FLOAT32; fz.count = 1;
-            frgb.name = "rgb"; frgb.offset = 12; frgb.datatype = sensor_msgs::msg::PointField::FLOAT32; frgb.count = 1;
-            cloudMsg.fields = {fx, fy, fz, frgb};
-
-            cloudMsg.data.resize(cloudPoints.size() * sizeof(float));
-            std::memcpy(cloudMsg.data.data(), cloudPoints.data(), cloudMsg.data.size());
-            debugCloudPub_->publish(cloudMsg);
-        }
-
-        //Draw detected tags on color frame
-        if (is_display_ && !matColorBGR.empty()) {
-            for (int i = 0; i < zarray_size(detections); i++) {
-                apriltag_detection_t* det;
-                zarray_get(detections, i, &det);
-                //Draw plane points if tag pose is detected
-                if (is_pose_detected.at(i)) {
-                    Eigen::Matrix3d homography;
-                    homography(0, 0) = det->H->data[0];
-                    homography(0, 1) = det->H->data[1];
-                    homography(0, 2) = det->H->data[2];
-                    homography(1, 0) = det->H->data[3];
-                    homography(1, 1) = det->H->data[4];
-                    homography(1, 2) = det->H->data[5];
-                    homography(2, 0) = det->H->data[6];
-                    homography(2, 1) = det->H->data[7];
-                    homography(2, 2) = det->H->data[8];
-                    for (double x = -1.0; x <= 1.0; x += 1.0 / 4.0) {
-                        for (double y = -1.0; y <= 1.0; y += 1.0 / 4.0) {
-                            Eigen::Vector3d uv1(x, y, 1.0);
-                            Eigen::Vector3d uv2 = homography * uv1;
-                            uv2 = uv2 * (1.0 / uv2.z());
-                            cv::circle(
-                                matColorBGR,
-                                cv::Point((int)uv2.x(), (int)uv2.y()),
-                                3, cv::Scalar(255, 0, 255), -1);
-                        }
-                    }
-                }
-                //Tag corners
-                cv::circle(
-                    matColorBGR,
-                    cv::Point(det->p[0][0], det->p[0][1]),
-                    5, cv::Scalar(0, 0, 255), -1);
-                cv::circle(
-                    matColorBGR,
-                    cv::Point(det->p[1][0], det->p[1][1]),
-                    5, cv::Scalar(0, 255, 0), -1);
-                cv::circle(
-                    matColorBGR,
-                    cv::Point(det->p[2][0], det->p[2][1]),
-                    5, cv::Scalar(255, 0, 0), -1);
-                cv::circle(
-                    matColorBGR,
-                    cv::Point(det->p[3][0], det->p[3][1]),
-                    5, cv::Scalar(255, 255, 0), -1);
-                //Tag center
-                cv::circle(
-                    matColorBGR,
-                    cv::Point(det->c[0], det->c[1]),
-                    5, cv::Scalar(0, 255, 255), -1);
-            }
-            cv::imshow("color", matColorBGR);
-        }
+        //Debug visualizations
+        publishDebugViz(detections, is_pose_detected, header, camera_frame,
+            matColorGray, matColorBGR, width, height, getPoint, isValid);
 
         //Free detected tags
         apriltag_detections_destroy(detections);
@@ -534,7 +746,7 @@ private:
         cv::Mat matColorGray(height, width, CV_8UC1);
         cv::Mat invalidMask(height, width, CV_8UC1, cv::Scalar(0));
         cv::Mat matColorBGR;
-        if (is_display_) {
+        if (is_display_ || is_debug_) {
             matColorBGR = cv::Mat(height, width, CV_8UC3);
         }
         int invalidNan = 0, invalidZero = 0, invalidNearZero = 0;
@@ -553,13 +765,13 @@ private:
                     else invalidNearZero++;
                     matColorGray.at<uint8_t>(py, px) = 0;
                     invalidMask.at<uint8_t>(py, px) = 255;
-                    if (is_display_) {
+                    if (is_display_ || is_debug_) {
                         matColorBGR.at<cv::Vec3b>(py, px) = cv::Vec3b(0, 0, 0);
                     }
                 } else {
                     matColorGray.at<uint8_t>(py, px) =
                         static_cast<uint8_t>(0.299 * r + 0.587 * g + 0.114 * b);
-                    if (is_display_) {
+                    if (is_display_ || is_debug_) {
                         matColorBGR.at<cv::Vec3b>(py, px) = cv::Vec3b(b, g, r);
                     }
                 }
@@ -575,7 +787,7 @@ private:
 
         if (totalInvalid > 0) {
             cv::inpaint(matColorGray, invalidMask, matColorGray, 3, cv::INPAINT_TELEA);
-            if (is_display_) {
+            if (is_display_ || is_debug_) {
                 cv::inpaint(matColorBGR, invalidMask, matColorBGR, 3, cv::INPAINT_TELEA);
             }
         }
@@ -592,6 +804,7 @@ private:
         auto isValid = [](const Eigen::Vector3d& p) -> bool {
             return std::isfinite(p.x()) && std::isfinite(p.y()) &&
                    std::isfinite(p.z()) && p.z() > 1e-3;
+            // true;
         };
 
         processDetections(matColorGray, matColorBGR, cloudMsg->header, getPoint, isValid);
@@ -634,7 +847,7 @@ private:
         if (matColor.channels() == 1) {
             matColorGray = matColor;
         } else {
-            cv::cvtColor(matColor, matColorGray, cv::COLOR_BGR2GRAY);
+            cv::cvtColor(matColor, matColorGray, cv::COLOR_RGB2GRAY);
         }
 
         // Convert depth image
@@ -662,11 +875,11 @@ private:
         }
 
         cv::Mat matColorBGR;
-        if (is_display_) {
+        if (is_display_ || is_debug_) {
             if (matColor.channels() == 1) {
                 cv::cvtColor(matColor, matColorBGR, cv::COLOR_GRAY2BGR);
             } else {
-                matColorBGR = matColor.clone();
+                cv::cvtColor(matColor, matColorBGR, cv::COLOR_RGB2BGR);
             }
         }
 
@@ -687,9 +900,46 @@ private:
         auto isValid = [](const Eigen::Vector3d& p) -> bool {
             return std::isfinite(p.x()) && std::isfinite(p.y()) &&
                    std::isfinite(p.z()) && p.z() > 1e-3;
+            // return true;
         };
 
         processDetections(matColorGray, matColorBGR, imageMsg->header, getPoint, isValid);
+
+        //Publish depth as point cloud
+        if (is_debug_ && debugDepthCloudPub_) {
+            std::vector<float> pts;
+            for (int py = 0; py < height; py++) {
+                for (int px = 0; px < width; px++) {
+                    float z = depthMeters.at<float>(py, px);
+                    if (!std::isfinite(z) || z < 1e-3) continue;
+                    float x = static_cast<float>((px - cx) * z / fx);
+                    float y = static_cast<float>((py - cy) * z / fy);
+                    pts.push_back(x);
+                    pts.push_back(y);
+                    pts.push_back(z);
+                }
+            }
+
+            int numPoints = pts.size() / 3;
+            sensor_msgs::msg::PointCloud2 cloudMsg;
+            cloudMsg.header = imageMsg->header;
+            cloudMsg.height = 1;
+            cloudMsg.width = numPoints;
+            cloudMsg.is_dense = true;
+            cloudMsg.is_bigendian = false;
+            cloudMsg.point_step = 12;  // 3 floats: x, y, z
+            cloudMsg.row_step = cloudMsg.point_step * numPoints;
+
+            sensor_msgs::msg::PointField pfx, pfy, pfz;
+            pfx.name = "x"; pfx.offset = 0; pfx.datatype = sensor_msgs::msg::PointField::FLOAT32; pfx.count = 1;
+            pfy.name = "y"; pfy.offset = 4; pfy.datatype = sensor_msgs::msg::PointField::FLOAT32; pfy.count = 1;
+            pfz.name = "z"; pfz.offset = 8; pfz.datatype = sensor_msgs::msg::PointField::FLOAT32; pfz.count = 1;
+            cloudMsg.fields = {pfx, pfy, pfz};
+
+            cloudMsg.data.resize(pts.size() * sizeof(float));
+            std::memcpy(cloudMsg.data.data(), pts.data(), cloudMsg.data.size());
+            debugDepthCloudPub_->publish(cloudMsg);
+        }
     }
 
     // ---- TF publishing ----
@@ -804,6 +1054,9 @@ private:
     //Debug publishers
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr debugCloudPub_;
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr debugSegPub_;
+    rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr debugGrayPub_;
+    rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr debugDetectionPub_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr debugDepthCloudPub_;
 
     //State
     uint64_t frameIndex_;
