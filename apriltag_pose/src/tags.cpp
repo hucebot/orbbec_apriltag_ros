@@ -1,6 +1,7 @@
 #include <iostream>
 #include <map>
 #include <cmath>
+#include <cstring>
 #include <chrono>
 #include <functional>
 #include <Eigen/Dense>
@@ -42,6 +43,8 @@ public:
         this->declare_parameter("tag_frame_prefix", "apriltag");
         this->declare_parameter("publishing_frame", "");
         this->declare_parameter("transform_timeout", 0.1);
+        this->declare_parameter("min_decision_margin", 30.0);
+        this->declare_parameter("debug", false);
         is_verbose_ = this->get_parameter("verbose").as_bool();
         is_display_ = this->get_parameter("display").as_bool();
         input_mode_ = this->get_parameter("input_mode").as_string();
@@ -50,6 +53,8 @@ public:
         publishing_frame_ = this->get_parameter("publishing_frame").as_string();
         transform_timeout_ = this->get_parameter("transform_timeout").as_double();
         depth_scale_ = this->get_parameter("depth_scale").as_double();
+        min_decision_margin_ = this->get_parameter("min_decision_margin").as_double();
+        is_debug_ = this->get_parameter("debug").as_bool();
 
         //Initialize AprilTag detector
         tagFamily_ = tag36h11_create();
@@ -87,6 +92,15 @@ public:
                     "TF broadcasting enabled: <cloud_frame> -> %s_<id>",
                     tag_frame_prefix_.c_str());
             }
+        }
+
+        //Setup debug publishers
+        if (is_debug_) {
+            debugCloudPub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
+                "apriltag_pose/debug/points", 10);
+            debugSegPub_ = this->create_publisher<sensor_msgs::msg::Image>(
+                "apriltag_pose/debug/segmentation", 10);
+            RCLCPP_INFO(this->get_logger(), "Debug publishers enabled");
         }
 
         //Setup subscriptions based on input mode
@@ -214,6 +228,17 @@ private:
             apriltag_detection_t* det;
             zarray_get(detections, i, &det);
 
+            //Filter by decision margin
+            if (det->decision_margin < min_decision_margin_) {
+                if (is_verbose_) {
+                    std::cout << "Tag " << det->id
+                        << " rejected: decision_margin=" << det->decision_margin
+                        << " < " << min_decision_margin_ << std::endl;
+                }
+                is_pose_detected.push_back(false);
+                continue;
+            }
+
             //Retrieve center and corners image coordinates
             Eigen::Vector2i uv0(det->c[0], det->c[1]);
             Eigen::Vector2i uv1(det->p[0][0], det->p[0][1]);
@@ -300,6 +325,95 @@ private:
         //Publish per-tag TF frames
         if (publish_tf_ && !camTagPoses.empty()) {
             publishTagTransforms(header, camTagPoses);
+        }
+
+        //Publish debug point cloud and segmentation image
+        if (is_debug_ && zarray_size(detections) > 0) {
+            //Tag colors for visualization (BGR order for cloud, but we store RGB)
+            static const uint8_t tagColors[][3] = {
+                {255, 0, 0}, {0, 255, 0}, {0, 0, 255},
+                {255, 255, 0}, {0, 255, 255}, {255, 0, 255},
+            };
+            static const int nColors = 6;
+
+            cv::Mat segMask(height, width, CV_8UC1, cv::Scalar(0));
+            std::vector<float> cloudPoints;  // x,y,z,rgb packed
+
+            for (int i = 0; i < zarray_size(detections); i++) {
+                if (!is_pose_detected.at(i)) continue;
+
+                apriltag_detection_t* det;
+                zarray_get(detections, i, &det);
+
+                //Build quad polygon from corners
+                std::vector<cv::Point> quad(4);
+                for (int j = 0; j < 4; j++) {
+                    quad[j] = cv::Point((int)det->p[j][0], (int)det->p[j][1]);
+                }
+
+                //Fill segmentation mask
+                cv::fillConvexPoly(segMask, quad, cv::Scalar(255));
+
+                //Compute bounding box of the quad
+                cv::Rect bbox = cv::boundingRect(quad);
+                int xmin = std::max(0, bbox.x);
+                int ymin = std::max(0, bbox.y);
+                int xmax = std::min(width - 1, bbox.x + bbox.width);
+                int ymax = std::min(height - 1, bbox.y + bbox.height);
+
+                //Pick color for this tag
+                const uint8_t* color = tagColors[i % nColors];
+                uint32_t rgbPacked = ((uint32_t)color[0] << 16) |
+                                     ((uint32_t)color[1] << 8) |
+                                     ((uint32_t)color[2]);
+                float rgbFloat;
+                std::memcpy(&rgbFloat, &rgbPacked, sizeof(float));
+
+                //Iterate pixels inside bounding box, test polygon membership
+                std::vector<cv::Point2f> testPts;
+                std::vector<std::pair<int,int>> validPixels;
+                for (int py = ymin; py <= ymax; py++) {
+                    for (int px = xmin; px <= xmax; px++) {
+                        if (cv::pointPolygonTest(quad, cv::Point2f(px, py), false) >= 0) {
+                            Eigen::Vector3d pt = getPoint(px, py);
+                            if (isValid(pt)) {
+                                cloudPoints.push_back(pt.x());
+                                cloudPoints.push_back(pt.y());
+                                cloudPoints.push_back(pt.z());
+                                cloudPoints.push_back(rgbFloat);
+                            }
+                        }
+                    }
+                }
+            }
+
+            //Publish segmentation image
+            std_msgs::msg::Header segHeader = header;
+            auto segMsg = cv_bridge::CvImage(segHeader, "mono8", segMask).toImageMsg();
+            debugSegPub_->publish(*segMsg);
+
+            //Publish debug point cloud
+            sensor_msgs::msg::PointCloud2 cloudMsg;
+            cloudMsg.header = header;
+            cloudMsg.header.frame_id = camera_frame;
+            int numPoints = cloudPoints.size() / 4;
+            cloudMsg.height = 1;
+            cloudMsg.width = numPoints;
+            cloudMsg.is_dense = true;
+            cloudMsg.is_bigendian = false;
+            cloudMsg.point_step = 16;  // 4 floats: x, y, z, rgb
+            cloudMsg.row_step = cloudMsg.point_step * numPoints;
+
+            sensor_msgs::msg::PointField fx, fy, fz, frgb;
+            fx.name = "x"; fx.offset = 0; fx.datatype = sensor_msgs::msg::PointField::FLOAT32; fx.count = 1;
+            fy.name = "y"; fy.offset = 4; fy.datatype = sensor_msgs::msg::PointField::FLOAT32; fy.count = 1;
+            fz.name = "z"; fz.offset = 8; fz.datatype = sensor_msgs::msg::PointField::FLOAT32; fz.count = 1;
+            frgb.name = "rgb"; frgb.offset = 12; frgb.datatype = sensor_msgs::msg::PointField::FLOAT32; frgb.count = 1;
+            cloudMsg.fields = {fx, fy, fz, frgb};
+
+            cloudMsg.data.resize(cloudPoints.size() * sizeof(float));
+            std::memcpy(cloudMsg.data.data(), cloudPoints.data(), cloudMsg.data.size());
+            debugCloudPub_->publish(cloudMsg);
         }
 
         //Draw detected tags on color frame
@@ -547,37 +661,12 @@ private:
             return;
         }
 
-        // Build invalid mask and inpaint grayscale for detection
-        cv::Mat invalidMask(height, width, CV_8UC1, cv::Scalar(0));
-        for (int py = 0; py < height; py++) {
-            for (int px = 0; px < width; px++) {
-                float z = depthMeters.at<float>(py, px);
-                if (!std::isfinite(z) || z < 1e-3) {
-                    invalidMask.at<uint8_t>(py, px) = 255;
-                    matColorGray.at<uint8_t>(py, px) = 0;
-                }
-            }
-        }
-
-        int totalInvalid = cv::countNonZero(invalidMask);
-        int totalPixels = width * height;
-        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-            "Invalid depth pixels: %d/%d (%.1f%%)",
-            totalInvalid, totalPixels, 100.0 * totalInvalid / totalPixels);
-
-        if (totalInvalid > 0) {
-            cv::inpaint(matColorGray, invalidMask, matColorGray, 3, cv::INPAINT_TELEA);
-        }
-
         cv::Mat matColorBGR;
         if (is_display_) {
             if (matColor.channels() == 1) {
                 cv::cvtColor(matColor, matColorBGR, cv::COLOR_GRAY2BGR);
             } else {
                 matColorBGR = matColor.clone();
-            }
-            if (totalInvalid > 0) {
-                cv::inpaint(matColorBGR, invalidMask, matColorBGR, 3, cv::INPAINT_TELEA);
             }
         }
 
@@ -709,6 +798,12 @@ private:
     std::string publishing_frame_;
     double transform_timeout_;
     double depth_scale_;
+    double min_decision_margin_;
+    bool is_debug_;
+
+    //Debug publishers
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr debugCloudPub_;
+    rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr debugSegPub_;
 
     //State
     uint64_t frameIndex_;
