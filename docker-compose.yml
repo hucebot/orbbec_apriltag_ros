@@ -20,13 +20,14 @@ services:
       - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
       - CYCLONEDDS_URI=file:///cyclonedds.xml
       - APRILTAG_VERBOSE=${APRILTAG_VERBOSE:-true}
-      - APRILTAG_DEBUG=${APRILTAG_DEBUG:-false}
+      - APRILTAG_DEBUG=${APRILTAG_DEBUG:-true}
       - APRILTAG_PUBLISHING_FRAME=${APRILTAG_PUBLISHING_FRAME:-}
       - ENABLE_APRILTAG_TO_BOX=${ENABLE_APRILTAG_TO_BOX:-false}
       - APRILTAG_TO_BOX_TAG_ID=${APRILTAG_TO_BOX_TAG_ID:-23}
       - BOX_POSE_TOPIC=${BOX_POSE_TOPIC:-/g1pilot/box_pose}
       - BOX_PUBLISHING_FRAME=${BOX_PUBLISHING_FRAME:-}
       - BOX_EXTENTS=${BOX_EXTENTS:-0.02,0.0,1.09,0.30,0.25,0.56}
+      - APRILTAG_FIX_NORMAL_AXIS=${APRILTAG_FIX_NORMAL_AXIS:-}
     volumes:
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
       - /dev/shm:/dev/shm

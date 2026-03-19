@@ -10,6 +10,7 @@
 #include <opencv2/opencv.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
+#include <std_msgs/msg/float32.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/msg/image.hpp>
@@ -46,6 +47,7 @@ public:
         this->declare_parameter("publishing_frame", "");
         this->declare_parameter("transform_timeout", 0.1);
         this->declare_parameter("min_decision_margin", 0.0);
+        this->declare_parameter("fix_normal_axis", "");  // fix tag normal to parent frame axis: "x","-x","y","-y","z","-z" or "" (disabled)
         this->declare_parameter("debug", false);
         is_verbose_ = this->get_parameter("verbose").as_bool();
         is_display_ = this->get_parameter("display").as_bool();
@@ -56,7 +58,29 @@ public:
         transform_timeout_ = this->get_parameter("transform_timeout").as_double();
         depth_scale_ = this->get_parameter("depth_scale").as_double();
         min_decision_margin_ = this->get_parameter("min_decision_margin").as_double();
+        fix_normal_axis_ = this->get_parameter("fix_normal_axis").as_string();
         is_debug_ = this->get_parameter("debug").as_bool();
+
+        // Parse and validate fix_normal_axis
+        if (!fix_normal_axis_.empty()) {
+            if (fix_normal_axis_ == "x")       fixedNormal_ = Eigen::Vector3d( 1, 0, 0);
+            else if (fix_normal_axis_ == "-x")  fixedNormal_ = Eigen::Vector3d(-1, 0, 0);
+            else if (fix_normal_axis_ == "y")   fixedNormal_ = Eigen::Vector3d( 0, 1, 0);
+            else if (fix_normal_axis_ == "-y")  fixedNormal_ = Eigen::Vector3d( 0,-1, 0);
+            else if (fix_normal_axis_ == "z")   fixedNormal_ = Eigen::Vector3d( 0, 0, 1);
+            else if (fix_normal_axis_ == "-z")  fixedNormal_ = Eigen::Vector3d( 0, 0,-1);
+            else {
+                RCLCPP_ERROR(this->get_logger(),
+                    "Invalid fix_normal_axis '%s'. Must be x,-x,y,-y,z,-z or empty. Disabling.",
+                    fix_normal_axis_.c_str());
+                fix_normal_axis_ = "";
+            }
+            if (!fix_normal_axis_.empty()) {
+                RCLCPP_INFO(this->get_logger(),
+                    "Tag normal will be fixed to '%s' axis of publishing frame",
+                    fix_normal_axis_.c_str());
+            }
+        }
 
         //Initialize AprilTag detector
         tagFamily_ = tag36h11_create();
@@ -218,6 +242,30 @@ private:
 
         result.inlierRatio = static_cast<double>(result.inliers) / points.size();
         result.success = result.inlierRatio >= 0.5;
+        if (!result.success) return result;
+
+        // Refine plane normal with SVD on inliers
+        // Collect inliers and compute centroid
+        std::vector<Eigen::Vector3d> inlierPts;
+        Eigen::Vector3d centroid = Eigen::Vector3d::Zero();
+        for (const auto& pt : points) {
+            if (std::abs(result.normal.dot(pt) + result.d) < threshold) {
+                inlierPts.push_back(pt);
+                centroid += pt;
+            }
+        }
+        centroid /= inlierPts.size();
+
+        // Build matrix of centered inlier points (N x 3)
+        Eigen::MatrixXd A(inlierPts.size(), 3);
+        for (size_t i = 0; i < inlierPts.size(); i++) {
+            A.row(i) = (inlierPts[i] - centroid).transpose();
+        }
+
+        // SVD: smallest singular value's right singular vector = plane normal
+        Eigen::JacobiSVD<Eigen::MatrixXd> svd(A, Eigen::ComputeThinV);
+        result.normal = svd.matrixV().col(2).normalized();
+        result.d = -result.normal.dot(centroid);
 
         //Ensure normal points toward camera (negative z direction)
         if (result.normal.z() > 0) {
@@ -291,22 +339,69 @@ private:
         std::function<Eigen::Vector3d(int, int)> getPoint,
         std::function<bool(const Eigen::Vector3d&)> isValid)
     {
+        // Project all 4 corners onto RANSAC plane
         Eigen::Vector3d p0 = rayPlaneIntersect(
             det->p[0][0], det->p[0][1], planeNormal, planeD, tagCenter, getPoint, isValid);
         Eigen::Vector3d p1 = rayPlaneIntersect(
             det->p[1][0], det->p[1][1], planeNormal, planeD, tagCenter, getPoint, isValid);
+        Eigen::Vector3d p2 = rayPlaneIntersect(
+            det->p[2][0], det->p[2][1], planeNormal, planeD, tagCenter, getPoint, isValid);
+        Eigen::Vector3d p3 = rayPlaneIntersect(
+            det->p[3][0], det->p[3][1], planeNormal, planeD, tagCenter, getPoint, isValid);
 
-        Eigen::Vector3d edgeDir = (p1 - p0).normalized();
-        //Make edge direction orthogonal to the plane normal
-        edgeDir = (edgeDir - edgeDir.dot(planeNormal) * planeNormal).normalized();
+        // Average both parallel edges for Z and Y directions
+        Eigen::Vector3d rawZ = ((p0 - p1) + (p3 - p2)).normalized();
+        Eigen::Vector3d rawY = -((p2 - p1) + (p3 - p0)).normalized();
 
-        Eigen::Vector3d vectZ_cam = edgeDir;
-        Eigen::Vector3d vectY_cam = -planeNormal.cross(vectZ_cam).normalized();
-        Eigen::Matrix3d rotCam = Eigen::Matrix3d::Identity();
-        rotCam.col(0) = -vectY_cam.cross(vectZ_cam);
+        // Project Z onto the SVD-refined plane, then derive Y via cross product
+        Eigen::Vector3d vectZ_cam = (rawZ - rawZ.dot(planeNormal) * planeNormal).normalized();
+        Eigen::Vector3d vectY_cam = planeNormal.cross(vectZ_cam).normalized();
+        // Ensure Y sense matches the corner-derived Y
+        if (vectY_cam.dot(rawY) < 0) vectY_cam = -vectY_cam;
+        // X from cross product (guaranteed orthogonal triad)
+        Eigen::Vector3d vectX_cam = vectY_cam.cross(vectZ_cam).normalized();
+
+        Eigen::Matrix3d rotCam;
+        rotCam.col(0) = -vectX_cam;
         rotCam.col(1) = -vectZ_cam;
         rotCam.col(2) = -vectY_cam;
         Eigen::Quaterniond q(rotCam);
+        q.normalize();
+        return q;
+    }
+
+    // ---- Fix tag normal to a parent-frame axis ----
+    // The tag's X axis (col 0 of rotation matrix) is the surface normal.
+    // This replaces it with the fixed axis and reorthogonalizes.
+
+    Eigen::Quaterniond fixNormalAxis(const Eigen::Quaterniond& orientation) const
+    {
+        Eigen::Matrix3d R = orientation.toRotationMatrix();
+
+        // col(0) is the tag normal, col(1) and col(2) are in-plane directions
+        // Replace normal with the fixed axis
+        Eigen::Vector3d newNormal = fixedNormal_;
+
+        // Keep col(1) as close to original as possible: project onto plane perpendicular to new normal
+        Eigen::Vector3d rawY = R.col(1);
+        Eigen::Vector3d newY = (rawY - rawY.dot(newNormal) * newNormal).normalized();
+
+        // If rawY was nearly parallel to newNormal, fall back to col(2)
+        if (newY.hasNaN() || newY.norm() < 0.5) {
+            Eigen::Vector3d rawZ = R.col(2);
+            Eigen::Vector3d newZ = (rawZ - rawZ.dot(newNormal) * newNormal).normalized();
+            newY = newZ.cross(newNormal).normalized();
+        }
+
+        // Complete the orthogonal triad
+        Eigen::Vector3d newZ = newNormal.cross(newY).normalized();
+
+        Eigen::Matrix3d Rfixed;
+        Rfixed.col(0) = newNormal;
+        Rfixed.col(1) = newY;
+        Rfixed.col(2) = newZ;
+
+        Eigen::Quaterniond q(Rfixed);
         q.normalize();
         return q;
     }
@@ -390,11 +485,21 @@ private:
         const std::string& frame_id,
         int tagId,
         const Eigen::Vector3d& position,
-        const Eigen::Quaterniond& orientation)
+        const Eigen::Quaterniond& orientation,
+        float confidence,
+        float inlierRatio,
+        int numPoints)
     {
+        std::string tagStr = "tag_" + std::to_string(tagId);
         if (containerPub_.count(tagId) == 0) {
             containerPub_[tagId] = this->create_publisher<geometry_msgs::msg::PoseStamped>(
-                "apriltag_pose/pose_tag_" + std::to_string(tagId), 10);
+                "apriltag_pose/pose_" + tagStr, 10);
+            metricsPub_[tagId]["decision_margin"] = this->create_publisher<std_msgs::msg::Float32>(
+                "apriltag_pose/metrics/decision_margin/" + tagStr, 10);
+            metricsPub_[tagId]["inlier_ratio"] = this->create_publisher<std_msgs::msg::Float32>(
+                "apriltag_pose/metrics/inlier_ratio/" + tagStr, 10);
+            metricsPub_[tagId]["num_points"] = this->create_publisher<std_msgs::msg::Float32>(
+                "apriltag_pose/metrics/num_points/" + tagStr, 10);
         }
 
         geometry_msgs::msg::PoseStamped msg;
@@ -408,6 +513,15 @@ private:
         msg.pose.orientation.z = orientation.z();
         msg.pose.orientation.w = orientation.w();
         containerPub_[tagId]->publish(msg);
+
+        auto publishMetric = [&](const std::string& name, float value) {
+            std_msgs::msg::Float32 m;
+            m.data = value;
+            metricsPub_[tagId][name]->publish(m);
+        };
+        publishMetric("decision_margin", confidence);
+        publishMetric("inlier_ratio", inlierRatio);
+        publishMetric("num_points", static_cast<float>(numPoints));
     }
 
     // ---- Draw detections on image ----
@@ -670,7 +784,14 @@ private:
                 posTag = frameTf.rotation * pos0 + frameTf.translation;
             }
 
-            publishTagPose(header, pose_frame_id, det->id, posTag, quatTag);
+            //Fix tag normal to a parent-frame axis (operates in publishing frame)
+            if (!fix_normal_axis_.empty()) {
+                quatTag = fixNormalAxis(quatTag);
+            }
+
+            publishTagPose(header, pose_frame_id, det->id, posTag, quatTag,
+                det->decision_margin, static_cast<float>(plane.inlierRatio),
+                static_cast<int>(tagPoints.size()));
             is_pose_detected.push_back(true);
         }
 
@@ -1027,6 +1148,7 @@ private:
 
     //Publishers indexed by tag id
     std::map<int, rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr> containerPub_;
+    std::map<int, std::map<std::string, rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr>> metricsPub_;
 
     //TF broadcaster
     std::unique_ptr<tf2_ros::TransformBroadcaster> tfBroadcaster_;
@@ -1049,6 +1171,8 @@ private:
     double transform_timeout_;
     double depth_scale_;
     double min_decision_margin_;
+    std::string fix_normal_axis_;
+    Eigen::Vector3d fixedNormal_;
     bool is_debug_;
 
     //Debug publishers
