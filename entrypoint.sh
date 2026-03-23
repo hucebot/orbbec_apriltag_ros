@@ -24,7 +24,13 @@ if [ -n "${BOX_PUBLISHING_FRAME}" ]; then
     LAUNCH_ARGS="${LAUNCH_ARGS} box_publishing_frame:=${BOX_PUBLISHING_FRAME}"
 fi
 LAUNCH_ARGS="${LAUNCH_ARGS} box_extents:=${BOX_EXTENTS:-0.02,0.0,1.09,0.30,0.25,0.56}"
-if [ -n "${APRILTAG_FIX_NORMAL_AXIS}" ]; then
-    LAUNCH_ARGS="${LAUNCH_ARGS} fix_normal_axis:=${APRILTAG_FIX_NORMAL_AXIS}"
+if [ -n "${APRILTAG_FIX_AXIS}" ]; then
+    LAUNCH_ARGS="${LAUNCH_ARGS} fix_axis:=${APRILTAG_FIX_AXIS}"
+fi
+if [ -n "${APRILTAG_POSE_MODE}" ]; then
+    LAUNCH_ARGS="${LAUNCH_ARGS} pose_mode:=${APRILTAG_POSE_MODE}"
+fi
+if [ -n "${APRILTAG_TAG_SIZE}" ]; then
+    LAUNCH_ARGS="${LAUNCH_ARGS} tag_size:=${APRILTAG_TAG_SIZE}"
 fi
 exec ros2 launch apriltag_pose apriltag_pose_rgbd.launch.py ${LAUNCH_ARGS}

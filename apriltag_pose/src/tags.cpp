@@ -25,6 +25,7 @@
 
 extern "C" {
 #include <apriltag.h>
+#include <apriltag_pose.h>
 #include <tag36h11.h>
 }
 
@@ -47,8 +48,10 @@ public:
         this->declare_parameter("publishing_frame", "");
         this->declare_parameter("transform_timeout", 0.1);
         this->declare_parameter("min_decision_margin", 0.0);
-        this->declare_parameter("fix_normal_axis", "");  // fix tag normal to parent frame axis: "x","-x","y","-y","z","-z" or "" (disabled)
+        this->declare_parameter("fix_axis", "");  // fix tag axis to parent frame axis: "tag_axis:frame_axis" e.g. "x:-z", "y:z" or legacy "z" (= "x:z")
         this->declare_parameter("debug", false);
+        this->declare_parameter("pose_mode", "depth");  // "depth" (RANSAC + depth) or "intrinsics" (classic apriltag pose from camera intrinsics)
+        this->declare_parameter("tag_size", 0.16);  // tag side length in meters (used when pose_mode=intrinsics)
         is_verbose_ = this->get_parameter("verbose").as_bool();
         is_display_ = this->get_parameter("display").as_bool();
         input_mode_ = this->get_parameter("input_mode").as_string();
@@ -58,27 +61,82 @@ public:
         transform_timeout_ = this->get_parameter("transform_timeout").as_double();
         depth_scale_ = this->get_parameter("depth_scale").as_double();
         min_decision_margin_ = this->get_parameter("min_decision_margin").as_double();
-        fix_normal_axis_ = this->get_parameter("fix_normal_axis").as_string();
+        fix_axis_ = this->get_parameter("fix_axis").as_string();
         is_debug_ = this->get_parameter("debug").as_bool();
+        pose_mode_ = this->get_parameter("pose_mode").as_string();
+        tag_size_ = this->get_parameter("tag_size").as_double();
 
-        // Parse and validate fix_normal_axis
-        if (!fix_normal_axis_.empty()) {
-            if (fix_normal_axis_ == "x")       fixedNormal_ = Eigen::Vector3d( 1, 0, 0);
-            else if (fix_normal_axis_ == "-x")  fixedNormal_ = Eigen::Vector3d(-1, 0, 0);
-            else if (fix_normal_axis_ == "y")   fixedNormal_ = Eigen::Vector3d( 0, 1, 0);
-            else if (fix_normal_axis_ == "-y")  fixedNormal_ = Eigen::Vector3d( 0,-1, 0);
-            else if (fix_normal_axis_ == "z")   fixedNormal_ = Eigen::Vector3d( 0, 0, 1);
-            else if (fix_normal_axis_ == "-z")  fixedNormal_ = Eigen::Vector3d( 0, 0,-1);
-            else {
-                RCLCPP_ERROR(this->get_logger(),
-                    "Invalid fix_normal_axis '%s'. Must be x,-x,y,-y,z,-z or empty. Disabling.",
-                    fix_normal_axis_.c_str());
-                fix_normal_axis_ = "";
+        if (pose_mode_ == "intrinsics") {
+            RCLCPP_INFO(this->get_logger(),
+                "Using classic AprilTag pose estimation (camera intrinsics, tag_size=%.3f m)", tag_size_);
+        } else if (pose_mode_ == "depth") {
+            RCLCPP_INFO(this->get_logger(), "Using depth-based pose estimation (RANSAC + median)");
+        } else {
+            RCLCPP_ERROR(this->get_logger(),
+                "Invalid pose_mode '%s'. Use 'depth' or 'intrinsics'. Defaulting to 'depth'.",
+                pose_mode_.c_str());
+            pose_mode_ = "depth";
+        }
+
+        // Parse and validate fix_axis
+        // Format: "tag_axis:frame_axis" e.g. "x:-z", "y:z"
+        // Legacy format: "z" is equivalent to "x:z" (fix tag normal to frame axis)
+        if (!fix_axis_.empty()) {
+            auto parseAxis = [](const std::string& s, Eigen::Vector3d& axis) -> bool {
+                if (s == "x")       { axis = Eigen::Vector3d( 1, 0, 0); return true; }
+                if (s == "-x")      { axis = Eigen::Vector3d(-1, 0, 0); return true; }
+                if (s == "y")       { axis = Eigen::Vector3d( 0, 1, 0); return true; }
+                if (s == "-y")      { axis = Eigen::Vector3d( 0,-1, 0); return true; }
+                if (s == "z")       { axis = Eigen::Vector3d( 0, 0, 1); return true; }
+                if (s == "-z")      { axis = Eigen::Vector3d( 0, 0,-1); return true; }
+                return false;
+            };
+            auto tagColFromAxis = [](const std::string& s) -> int {
+                std::string a = s;
+                if (a.size() > 1 && a[0] == '-') a = a.substr(1);
+                if (a == "x") return 0;
+                if (a == "y") return 1;
+                if (a == "z") return 2;
+                return -1;
+            };
+
+            bool valid = false;
+            size_t colon = fix_axis_.find(':');
+            if (colon != std::string::npos) {
+                // New format: "tag_axis:frame_axis"
+                std::string tagAxisStr = fix_axis_.substr(0, colon);
+                std::string frameAxisStr = fix_axis_.substr(colon + 1);
+                fixedTagCol_ = tagColFromAxis(tagAxisStr);
+                Eigen::Vector3d tagDir, frameDir;
+                if (fixedTagCol_ >= 0 && parseAxis(tagAxisStr, tagDir) && parseAxis(frameAxisStr, frameDir)) {
+                    // The fixed frame axis direction accounts for sign of tag axis
+                    // e.g. "-x:z" means tag's -X should align with frame Z,
+                    // so tag's X column should be -Z
+                    double tagSign = (tagAxisStr[0] == '-') ? -1.0 : 1.0;
+                    fixedFrameAxis_ = tagSign * frameDir;
+                    valid = true;
+                }
+            } else {
+                // Legacy format: "z" means fix tag X (normal) to frame z
+                Eigen::Vector3d frameDir;
+                if (parseAxis(fix_axis_, frameDir)) {
+                    fixedTagCol_ = 0;
+                    fixedFrameAxis_ = frameDir;
+                    valid = true;
+                }
             }
-            if (!fix_normal_axis_.empty()) {
+
+            if (!valid) {
+                RCLCPP_ERROR(this->get_logger(),
+                    "Invalid fix_axis '%s'. Use 'tag_axis:frame_axis' (e.g. 'x:-z', 'y:z') or legacy 'z'. Disabling.",
+                    fix_axis_.c_str());
+                fix_axis_ = "";
+            } else {
+                const char* colNames[] = {"X", "Y", "Z"};
                 RCLCPP_INFO(this->get_logger(),
-                    "Tag normal will be fixed to '%s' axis of publishing frame",
-                    fix_normal_axis_.c_str());
+                    "Tag %s axis will be fixed to [%.0f,%.0f,%.0f] of publishing frame",
+                    colNames[fixedTagCol_],
+                    fixedFrameAxis_.x(), fixedFrameAxis_.y(), fixedFrameAxis_.z());
             }
         }
 
@@ -370,36 +428,37 @@ private:
         return q;
     }
 
-    // ---- Fix tag normal to a parent-frame axis ----
-    // The tag's X axis (col 0 of rotation matrix) is the surface normal.
-    // This replaces it with the fixed axis and reorthogonalizes.
+    // ---- Fix a tag axis to a parent-frame axis ----
+    // Replaces col(fixedTagCol_) with fixedFrameAxis_ and reorthogonalizes.
 
-    Eigen::Quaterniond fixNormalAxis(const Eigen::Quaterniond& orientation) const
+    Eigen::Quaterniond fixAxis(const Eigen::Quaterniond& orientation) const
     {
         Eigen::Matrix3d R = orientation.toRotationMatrix();
 
-        // col(0) is the tag normal, col(1) and col(2) are in-plane directions
-        // Replace normal with the fixed axis
-        Eigen::Vector3d newNormal = fixedNormal_;
+        int c0 = fixedTagCol_;           // column to fix
+        int c1 = (c0 + 1) % 3;          // next column: keep close to original
+        int c2 = (c0 + 2) % 3;          // third column: derived via cross product
 
-        // Keep col(1) as close to original as possible: project onto plane perpendicular to new normal
-        Eigen::Vector3d rawY = R.col(1);
-        Eigen::Vector3d newY = (rawY - rawY.dot(newNormal) * newNormal).normalized();
+        Eigen::Vector3d newC0 = fixedFrameAxis_;
 
-        // If rawY was nearly parallel to newNormal, fall back to col(2)
-        if (newY.hasNaN() || newY.norm() < 0.5) {
-            Eigen::Vector3d rawZ = R.col(2);
-            Eigen::Vector3d newZ = (rawZ - rawZ.dot(newNormal) * newNormal).normalized();
-            newY = newZ.cross(newNormal).normalized();
+        // Keep c1 as close to original as possible: project onto plane perpendicular to newC0
+        Eigen::Vector3d rawC1 = R.col(c1);
+        Eigen::Vector3d newC1 = (rawC1 - rawC1.dot(newC0) * newC0).normalized();
+
+        // If rawC1 was nearly parallel to newC0, fall back to c2
+        if (newC1.hasNaN() || newC1.norm() < 0.5) {
+            Eigen::Vector3d rawC2 = R.col(c2);
+            Eigen::Vector3d newC2 = (rawC2 - rawC2.dot(newC0) * newC0).normalized();
+            newC1 = newC2.cross(newC0).normalized();
         }
 
-        // Complete the orthogonal triad
-        Eigen::Vector3d newZ = newNormal.cross(newY).normalized();
+        // Complete the orthogonal triad (right-handed)
+        Eigen::Vector3d newC2 = newC0.cross(newC1).normalized();
 
         Eigen::Matrix3d Rfixed;
-        Rfixed.col(0) = newNormal;
-        Rfixed.col(1) = newY;
-        Rfixed.col(2) = newZ;
+        Rfixed.col(c0) = newC0;
+        Rfixed.col(c1) = newC1;
+        Rfixed.col(c2) = newC2;
 
         Eigen::Quaterniond q(Rfixed);
         q.normalize();
@@ -747,31 +806,77 @@ private:
                 continue;
             }
 
-            //Collect valid 3D points inside the tag quad
-            auto tagPoints = collectTagPoints(det, width, height, getPoint, isValid);
-            if (tagPoints.size() < 10) {
-                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                    "Tag %d: only %zu valid depth points inside quad, need at least 10",
-                    det->id, tagPoints.size());
-                is_pose_detected.push_back(false);
-                continue;
-            }
+            Eigen::Vector3d pos0;
+            Eigen::Quaterniond quatCam;
+            float inlierRatio = 0.0f;
+            int numPoints = 0;
 
-            //RANSAC plane fitting
-            PlaneResult plane = fitPlaneRANSAC(tagPoints, 100, ransacThresh);
-            if (!plane.success) {
-                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                    "Tag %d: RANSAC plane fit poor — %d/%zu inliers (%.0f%%)",
-                    det->id, plane.inliers, tagPoints.size(), plane.inlierRatio * 100);
-                is_pose_detected.push_back(false);
-                continue;
-            }
+            if (pose_mode_ == "intrinsics") {
+                // Classic apriltag pose estimation using camera intrinsics
+                if (!cameraInfo_) {
+                    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                        "Tag %d: no CameraInfo received yet, cannot estimate pose", det->id);
+                    is_pose_detected.push_back(false);
+                    continue;
+                }
+                apriltag_detection_info_t info;
+                info.det = det;
+                info.tagsize = tag_size_;
+                info.fx = cameraInfo_->k[0];
+                info.fy = cameraInfo_->k[4];
+                info.cx = cameraInfo_->k[2];
+                info.cy = cameraInfo_->k[5];
 
-            //Compute tag position (median of inliers) and orientation
-            Eigen::Vector3d pos0 = computeMedianInlierPosition(
-                tagPoints, plane.normal, plane.d, ransacThresh);
-            Eigen::Quaterniond quatCam = computeTagOrientation(
-                det, plane.normal, plane.d, pos0, getPoint, isValid);
+                apriltag_pose_t pose1, pose2;
+                double err1, err2;
+                estimate_tag_pose_orthogonal_iteration(&info, &err1, &pose1, &err2, &pose2, 50);
+
+                // Pick the pose with lower error
+                apriltag_pose_t& pose = (err1 <= err2) ? pose1 : pose2;
+
+                pos0 = Eigen::Vector3d(
+                    pose.t->data[0], pose.t->data[1], pose.t->data[2]);
+
+                Eigen::Matrix3d R;
+                for (int r = 0; r < 3; r++)
+                    for (int c = 0; c < 3; c++)
+                        R(r, c) = pose.R->data[r * 3 + c];
+                quatCam = Eigen::Quaterniond(R);
+                quatCam.normalize();
+
+                matd_destroy(pose1.R); matd_destroy(pose1.t);
+                matd_destroy(pose2.R); matd_destroy(pose2.t);
+
+                inlierRatio = 1.0f;
+                numPoints = 4;
+            } else {
+                // Depth-based pose estimation (RANSAC + median)
+                auto tagPoints = collectTagPoints(det, width, height, getPoint, isValid);
+                if (tagPoints.size() < 10) {
+                    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                        "Tag %d: only %zu valid depth points inside quad, need at least 10",
+                        det->id, tagPoints.size());
+                    is_pose_detected.push_back(false);
+                    continue;
+                }
+
+                PlaneResult plane = fitPlaneRANSAC(tagPoints, 100, ransacThresh);
+                if (!plane.success) {
+                    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                        "Tag %d: RANSAC plane fit poor — %d/%zu inliers (%.0f%%)",
+                        det->id, plane.inliers, tagPoints.size(), plane.inlierRatio * 100);
+                    is_pose_detected.push_back(false);
+                    continue;
+                }
+
+                pos0 = computeMedianInlierPosition(
+                    tagPoints, plane.normal, plane.d, ransacThresh);
+                quatCam = computeTagOrientation(
+                    det, plane.normal, plane.d, pos0, getPoint, isValid);
+
+                inlierRatio = static_cast<float>(plane.inlierRatio);
+                numPoints = static_cast<int>(tagPoints.size());
+            }
 
             camTagPoses.push_back({det->id, pos0, quatCam});
 
@@ -784,14 +889,13 @@ private:
                 posTag = frameTf.rotation * pos0 + frameTf.translation;
             }
 
-            //Fix tag normal to a parent-frame axis (operates in publishing frame)
-            if (!fix_normal_axis_.empty()) {
-                quatTag = fixNormalAxis(quatTag);
+            //Fix tag axis to a parent-frame axis (operates in publishing frame)
+            if (!fix_axis_.empty()) {
+                quatTag = fixAxis(quatTag);
             }
 
             publishTagPose(header, pose_frame_id, det->id, posTag, quatTag,
-                det->decision_margin, static_cast<float>(plane.inlierRatio),
-                static_cast<int>(tagPoints.size()));
+                det->decision_margin, inlierRatio, numPoints);
             is_pose_detected.push_back(true);
         }
 
@@ -812,6 +916,8 @@ private:
         if (is_verbose_) {
             std::cout
                 << "Process frame_index=" << frameIndex_
+                << " pose_mode=" << pose_mode_
+                << (pose_mode_ == "intrinsics" ? " tag_size=" + std::to_string(tag_size_) : "")
                 << " tags=" << camTagPoses.size()
                 << " detection="
                 << (std::chrono::duration<double, std::milli>(
@@ -1171,8 +1277,11 @@ private:
     double transform_timeout_;
     double depth_scale_;
     double min_decision_margin_;
-    std::string fix_normal_axis_;
-    Eigen::Vector3d fixedNormal_;
+    std::string fix_axis_;
+    int fixedTagCol_ = 0;
+    Eigen::Vector3d fixedFrameAxis_;
+    std::string pose_mode_;
+    double tag_size_;
     bool is_debug_;
 
     //Debug publishers

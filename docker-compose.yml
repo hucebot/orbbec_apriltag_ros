@@ -27,7 +27,9 @@ services:
       - BOX_POSE_TOPIC=${BOX_POSE_TOPIC:-/g1pilot/box_pose}
       - BOX_PUBLISHING_FRAME=${BOX_PUBLISHING_FRAME:-}
       - BOX_EXTENTS=${BOX_EXTENTS:-0.02,0.0,1.09,0.30,0.25,0.56}
-      - APRILTAG_FIX_NORMAL_AXIS=${APRILTAG_FIX_NORMAL_AXIS:-}
+      - APRILTAG_FIX_AXIS=${APRILTAG_FIX_AXIS:-}
+      - APRILTAG_POSE_MODE=${APRILTAG_POSE_MODE:-}
+      - APRILTAG_TAG_SIZE=${APRILTAG_TAG_SIZE:-}
     volumes:
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
       - /dev/shm:/dev/shm
