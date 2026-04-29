@@ -3,7 +3,7 @@ set -e
 
 echo "=== apriltag_pose entrypoint ==="
 
-source /opt/ros/${ROS_DISTRO:-jazzy}/setup.bash
+source /opt/ros/${ROS_DISTRO:-humble}/setup.bash
 
 cd /ros2_ws
 
@@ -33,4 +33,4 @@ fi
 if [ -n "${APRILTAG_TAG_SIZE}" ]; then
     LAUNCH_ARGS="${LAUNCH_ARGS} tag_size:=${APRILTAG_TAG_SIZE}"
 fi
-exec ros2 launch apriltag_pose apriltag_pose_rgbd.launch.py ${LAUNCH_ARGS}
+exec "$@"

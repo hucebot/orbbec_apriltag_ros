@@ -1,5 +1,5 @@
-FROM nvidia/cuda:12.6.1-cudnn-devel-ubuntu24.04
-ENV ROS_DISTRO=jazzy
+FROM nvidia/cuda:12.6.1-cudnn-devel-ubuntu22.04
+ENV ROS_DISTRO=humble
 
 ENV DISPLAY=:0
 ENV LIBGL_ALWAYS_INDIRECT=0
@@ -23,7 +23,7 @@ RUN apt-get update && apt-get install -y --fix-missing \
     libv4l-dev v4l-utils wget curl libnuma-dev libnuma1 libgles-dev \
     libglvnd-dev libgl1-mesa-dev libglu1-mesa-dev
 
-#Install ROS 2 Jazzy
+#Install ROS 2 humble
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates gnupg && \
     rm -rf /var/lib/apt/lists/*
 RUN ROS_APT_SOURCE_VERSION="$(curl -fsSL https://api.github.com/repos/ros-infrastructure/ros-apt-source/releases/latest \
