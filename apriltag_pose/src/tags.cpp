@@ -9,6 +9,7 @@
 #include <Eigen/Dense>
 #include <opencv2/opencv.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <rclcpp/wait_for_message.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <std_msgs/msg/float32.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
@@ -17,6 +18,7 @@
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/buffer.h>
+#include <tf2_ros/buffer_interface.h>
 #include <tf2_ros/transform_listener.h>
 #include <message_filters/subscriber.h>
 #include <message_filters/sync_policies/approximate_time.h>
@@ -193,27 +195,49 @@ public:
             RCLCPP_INFO(this->get_logger(), "Debug publishers enabled");
         }
 
-        //Setup subscriptions based on input mode
+        timeProcessLoop_ = std::chrono::high_resolution_clock::now();
+    }
+
+    // Must be called once after the node is owned by a shared_ptr (uses
+    // shared_from_this for wait_for_message).
+    void setupSubscriptions()
+    {
+        // Bounded-buffer QoS: Reliable, KEEP_LAST, Depth=5. Old frames are
+        // evicted at the DDS layer so the apriltag pipeline cannot build up
+        // unbounded backlog (the original default-10 queue drifted to ~1.9 s
+        // under live load), but a small window absorbs transient slow
+        // detections so we don't drop every frame whose processing is
+        // briefly over the input period.
+        // At 6 FPS this caps the lag at ~5 × 167 ms ≈ 830 ms.
         rmw_qos_profile_t qos_profile = rmw_qos_profile_default;
-        qos_profile.depth = 10;
+        qos_profile.depth = 5;
 
         if (input_mode_ == "rgbd") {
             std::string image_topic = this->get_parameter("image_topic").as_string();
             std::string depth_topic = this->get_parameter("depth_topic").as_string();
             std::string camera_info_topic = this->get_parameter("camera_info_topic").as_string();
 
-            // Camera info subscription (async, cached)
-            subCameraInfo_ = this->create_subscription<sensor_msgs::msg::CameraInfo>(
-                camera_info_topic,
-                rclcpp::QoS(rclcpp::QoSInitialization::from_rmw(qos_profile)),
-                std::bind(&AprilTagNode::cameraInfoCallback, this, std::placeholders::_1));
+            // CameraInfo doesn't change at runtime — fetch it once at startup
+            // and cache it, so the RGBD callback never has to wait on it.
+            sensor_msgs::msg::CameraInfo info_msg;
+            RCLCPP_INFO(this->get_logger(), "Waiting for CameraInfo on %s...",
+                camera_info_topic.c_str());
+            if (!rclcpp::wait_for_message(info_msg, this->shared_from_this(),
+                    camera_info_topic, std::chrono::seconds(10))) {
+                RCLCPP_FATAL(this->get_logger(),
+                    "Timed out waiting for CameraInfo on %s", camera_info_topic.c_str());
+                throw std::runtime_error("CameraInfo not received");
+            }
+            cameraInfo_ = std::make_shared<const sensor_msgs::msg::CameraInfo>(info_msg);
+            RCLCPP_INFO(this->get_logger(), "CameraInfo received and cached");
 
-            // Synchronized RGB + Depth
+            // Synchronized RGB + Depth — low-latency QoS so we drop old frames
+            // instead of queuing under load.
             subImage_ = std::make_shared<message_filters::Subscriber<sensor_msgs::msg::Image>>(
-                this, image_topic, rmw_qos_profile_default);
+                this, image_topic, qos_profile);
             subDepth_ = std::make_shared<message_filters::Subscriber<sensor_msgs::msg::Image>>(
-                this, depth_topic, rmw_qos_profile_default);
-            sync_ = std::make_shared<Sync>(SyncPolicy(10), *subImage_, *subDepth_);
+                this, depth_topic, qos_profile);
+            sync_ = std::make_shared<Sync>(SyncPolicy(5), *subImage_, *subDepth_);
             sync_->registerCallback(
                 std::bind(&AprilTagNode::rgbdCallback, this,
                     std::placeholders::_1, std::placeholders::_2));
@@ -221,7 +245,6 @@ public:
             RCLCPP_INFO(this->get_logger(), "AprilTag detector initialized in RGBD mode. Subscribing to:");
             RCLCPP_INFO(this->get_logger(), "  Image: %s", image_topic.c_str());
             RCLCPP_INFO(this->get_logger(), "  Depth: %s", depth_topic.c_str());
-            RCLCPP_INFO(this->get_logger(), "  CameraInfo: %s", camera_info_topic.c_str());
         } else {
             std::string cloud_topic = this->get_parameter("cloud_topic").as_string();
             subCloud_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
@@ -232,8 +255,6 @@ public:
             RCLCPP_INFO(this->get_logger(), "AprilTag detector initialized in PointCloud mode. Subscribing to:");
             RCLCPP_INFO(this->get_logger(), "  PointCloud: %s", cloud_topic.c_str());
         }
-
-        timeProcessLoop_ = std::chrono::high_resolution_clock::now();
     }
 
     ~AprilTagNode()
@@ -508,15 +529,20 @@ private:
         std::string frame_id;
     };
 
-    FrameTransform lookupPublishingFrame(const std::string& camera_frame)
+    FrameTransform lookupPublishingFrame(
+        const std::string& camera_frame, const rclcpp::Time& stamp)
     {
         FrameTransform tf{false, Eigen::Quaterniond::Identity(), Eigen::Vector3d::Zero(), camera_frame};
         if (publishing_frame_.empty() || !tfBuffer_) return tf;
 
         try {
+            // Look up the transform at the image timestamp (not tf2::TimePointZero).
+            // Using TimePointZero takes the latest buffered TF, which drifts when
+            // the camera is moving and the TF stream has any latency relative to
+            // the image stream. `fromRclcpp` converts rclcpp::Time -> tf2::TimePoint.
             auto tfStamped = tfBuffer_->lookupTransform(
                 publishing_frame_, camera_frame,
-                tf2::TimePointZero,
+                tf2_ros::fromRclcpp(stamp),
                 tf2::durationFromSec(transform_timeout_));
             tf.rotation = Eigen::Quaterniond(
                 tfStamped.transform.rotation.w,
@@ -769,8 +795,8 @@ private:
         zarray_t* detections = apriltag_detector_detect(tagDetector_, &image);
         auto timeDetectionEnd = std::chrono::high_resolution_clock::now();
 
-        //Look up publishing frame transform
-        FrameTransform frameTf = lookupPublishingFrame(camera_frame);
+        //Look up publishing frame transform at the image timestamp
+        FrameTransform frameTf = lookupPublishingFrame(camera_frame, header.stamp);
         std::string pose_frame_id = frameTf.valid ? frameTf.frame_id : camera_frame;
 
         //Process each detected tag
@@ -1039,12 +1065,6 @@ private:
 
     // ---- RGBD mode callback ----
 
-    void cameraInfoCallback(const sensor_msgs::msg::CameraInfo::ConstSharedPtr& msg)
-    {
-        RCLCPP_INFO_ONCE(this->get_logger(), "Received first CameraInfo message");
-        cameraInfo_ = msg;
-    }
-
     void rgbdCallback(
         const sensor_msgs::msg::Image::ConstSharedPtr& imageMsg,
         const sensor_msgs::msg::Image::ConstSharedPtr& depthMsg)
@@ -1054,12 +1074,6 @@ private:
             imageMsg->width, imageMsg->height, imageMsg->encoding.c_str(),
             depthMsg->width, depthMsg->height, depthMsg->encoding.c_str());
         frameIndex_++;
-
-        if (!cameraInfo_) {
-            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                "No CameraInfo received yet, skipping frame");
-            return;
-        }
 
         // Convert RGB image to grayscale
         cv::Mat matColor;
@@ -1183,9 +1197,12 @@ private:
         if (useParent) {
             geometry_msgs::msg::TransformStamped parentToCam;
             try {
+                // Same fix as in lookupPublishingFrame: use the image stamp
+                // (header.stamp) so the published TF matches the data it was
+                // computed from, instead of grabbing the latest buffered TF.
                 parentToCam = tfBuffer_->lookupTransform(
                     publishing_frame_, header.frame_id,
-                    tf2::TimePointZero,
+                    tf2_ros::fromRclcpp(rclcpp::Time(header.stamp)),
                     tf2::durationFromSec(transform_timeout_));
             } catch (const tf2::TransformException& ex) {
                 RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
@@ -1239,7 +1256,6 @@ private:
 
     //Subscribers
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr subCloud_;
-    rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr subCameraInfo_;
     std::shared_ptr<message_filters::Subscriber<sensor_msgs::msg::Image>> subImage_;
     std::shared_ptr<message_filters::Subscriber<sensor_msgs::msg::Image>> subDepth_;
 
@@ -1300,6 +1316,7 @@ int main(int argc, char** argv)
 {
     rclcpp::init(argc, argv);
     auto node = std::make_shared<AprilTagNode>();
+    node->setupSubscriptions();
 
     if (node->isDisplay()) {
         //OpenCV HighGUI requires waitKey from the main thread
