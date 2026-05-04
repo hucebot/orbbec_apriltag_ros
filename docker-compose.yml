@@ -21,7 +21,7 @@ services:
       - CYCLONEDDS_URI=file:///cyclonedds.xml
       - APRILTAG_VERBOSE=${APRILTAG_VERBOSE:-true}
       - APRILTAG_DEBUG=${APRILTAG_DEBUG:-true}
-      - APRILTAG_PUBLISHING_FRAME=${APRILTAG_PUBLISHING_FRAME:-}
+      - APRILTAG_PUBLISHING_FRAME=${APRILTAG_PUBLISHING_FRAME:-head_front_camera_link}
       - ENABLE_APRILTAG_TO_BOX=${ENABLE_APRILTAG_TO_BOX:-false}
       - APRILTAG_TO_BOX_TAG_ID=${APRILTAG_TO_BOX_TAG_ID:-23}
       - BOX_POSE_TOPIC=${BOX_POSE_TOPIC:-/g1pilot/box_pose}
@@ -30,6 +30,10 @@ services:
       - APRILTAG_FIX_AXIS=${APRILTAG_FIX_AXIS:-}
       - APRILTAG_POSE_MODE=${APRILTAG_POSE_MODE:-}
       - APRILTAG_TAG_SIZE=${APRILTAG_TAG_SIZE:-}
+      - IMAGE_TOPIC=/rgbd/realsense_head_front/color/image_raw
+      - DEPTH_TOPIC=/rgbd/realsense_head_front/aligned_depth_to_color/image_raw
+      - CAMERA_INFO_TOPIC=/rgbd/realsense_head_front/color/camera_info
+      - APRILTAG_DISPLAY=true
     volumes:
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
       - /dev/shm:/dev/shm

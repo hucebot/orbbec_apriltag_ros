@@ -248,6 +248,61 @@ public:
     bool isDisplay() const { return is_display_; }
 
 private:
+    struct PoseFilter {
+        bool initialized = false;
+        Eigen::Vector3d pos, vel;
+        Eigen::Quaterniond quat;
+        Eigen::Matrix<double, 6, 6> P;
+
+        void update(double dt, const Eigen::Vector3d& meas_pos, const Eigen::Quaterniond& meas_quat,
+                    double process_noise = 0.1, double meas_noise = 0.05, double slerp_factor = 0.15)
+        {
+            if (!initialized || dt > 1.0) { // Reinitialize if tag was lost for > 1 second
+                pos = meas_pos;
+                vel = Eigen::Vector3d::Zero();
+                quat = meas_quat;
+                P = Eigen::Matrix<double, 6, 6>::Identity();
+                initialized = true;
+                return;
+            }
+
+            // --- Position KF (Constant Velocity) ---
+            Eigen::Matrix<double, 6, 6> F = Eigen::Matrix<double, 6, 6>::Identity();
+            F.topRightCorner(3, 3) = Eigen::Matrix3d::Identity() * dt;
+
+            Eigen::Matrix<double, 6, 6> Q = Eigen::Matrix<double, 6, 6>::Identity() * process_noise;
+            Eigen::Matrix<double, 6, 1> x_pred;
+            x_pred << pos, vel;
+            x_pred = F * x_pred;
+            Eigen::Matrix<double, 6, 6> P_pred = F * P * F.transpose() + Q;
+
+            Eigen::Matrix<double, 3, 6> H = Eigen::Matrix<double, 3, 6>::Zero();
+            H.topLeftCorner(3, 3) = Eigen::Matrix3d::Identity();
+
+            Eigen::Matrix3d R = Eigen::Matrix3d::Identity() * meas_noise;
+            Eigen::Matrix3d S = H * P_pred * H.transpose() + R;
+            Eigen::Matrix<double, 6, 3> K = P_pred * H.transpose() * S.inverse();
+
+            Eigen::Vector3d y = meas_pos - (H * x_pred);
+            Eigen::Matrix<double, 6, 1> x_upd = x_pred + K * y;
+
+            P = (Eigen::Matrix<double, 6, 6>::Identity() - K * H) * P_pred;
+            pos = x_upd.head<3>();
+            vel = x_upd.tail<3>();
+
+            // --- Orientation Smoothing (SLERP) ---
+            // Take the shortest path
+            if (quat.dot(meas_quat) < 0) {
+                quat = quat.slerp(slerp_factor, Eigen::Quaterniond(-meas_quat.w(), -meas_quat.x(), -meas_quat.y(), -meas_quat.z()));
+            } else {
+                quat = quat.slerp(slerp_factor, meas_quat);
+            }
+            quat.normalize();
+        }
+    };
+
+    std::map<int, PoseFilter> poseFilters_;
+    std::map<int, rclcpp::Time> lastTagTimes_;
 
     //Camera-frame pose of a detected tag (before any coordinate transform)
     struct CamTagPose {
@@ -878,9 +933,27 @@ private:
                 numPoints = static_cast<int>(tagPoints.size());
             }
 
+            // Apply Kalman/SLERP Filter on the raw camera-frame pose
+            rclcpp::Time currentTime(header.stamp.sec, header.stamp.nanosec);
+            double dt = 0.033; // Default ~30fps
+            if (lastTagTimes_.count(det->id)) {
+                dt = (currentTime - lastTagTimes_[det->id]).seconds();
+            }
+            lastTagTimes_[det->id] = currentTime;
+
+            // Failsafe for bag looping backwards
+            if (dt < 0.0) dt = 0.033;
+
+            poseFilters_[det->id].update(dt, pos0, quatCam);
+
+            // Overwrite raw variables with filtered data BEFORE downstream transforms
+            pos0 = poseFilters_[det->id].pos;
+            quatCam = poseFilters_[det->id].quat;
+
+            // Push the filtered camera-frame pose
             camTagPoses.push_back({det->id, pos0, quatCam});
 
-            //Transform to parent frame if needed
+            // Transform to parent frame if needed
             Eigen::Vector3d posTag = pos0;
             Eigen::Quaterniond quatTag = quatCam;
             if (frameTf.valid) {
@@ -889,11 +962,12 @@ private:
                 posTag = frameTf.rotation * pos0 + frameTf.translation;
             }
 
-            //Fix tag axis to a parent-frame axis (operates in publishing frame)
+            // Fix tag axis to a parent-frame axis (operates in publishing frame)
             if (!fix_axis_.empty()) {
                 quatTag = fixAxis(quatTag);
             }
 
+            // Publish the final transformed & filtered pose
             publishTagPose(header, pose_frame_id, det->id, posTag, quatTag,
                 det->decision_margin, inlierRatio, numPoints);
             is_pose_detected.push_back(true);
