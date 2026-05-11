@@ -17,6 +17,7 @@
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/buffer.h>
+#include <tf2_ros/buffer_interface.h>
 #include <tf2_ros/transform_listener.h>
 #include <message_filters/subscriber.h>
 #include <message_filters/sync_policies/approximate_time.h>
@@ -197,6 +198,16 @@ public:
         rmw_qos_profile_t qos_profile = rmw_qos_profile_default;
         qos_profile.depth = 10;
 
+        // Bounded-buffer QoS for the image + depth streams: Reliable,
+        // KEEP_LAST, Depth=5. Old frames are evicted at the DDS layer so the
+        // apriltag pipeline cannot build up unbounded backlog (the original
+        // default-10 queue drifted to ~1.9 s under live load), but a small
+        // window absorbs transient slow detections so we don't drop every
+        // frame whose processing is briefly over the input period.
+        // At 6 FPS this caps the lag at ~5 × 167 ms ≈ 830 ms.
+        rmw_qos_profile_t qos_profile_image = rmw_qos_profile_default;
+        qos_profile_image.depth = 5;
+
         if (input_mode_ == "rgbd") {
             std::string image_topic = this->get_parameter("image_topic").as_string();
             std::string depth_topic = this->get_parameter("depth_topic").as_string();
@@ -208,12 +219,13 @@ public:
                 rclcpp::QoS(rclcpp::QoSInitialization::from_rmw(qos_profile)),
                 std::bind(&AprilTagNode::cameraInfoCallback, this, std::placeholders::_1));
 
-            // Synchronized RGB + Depth
+            // Synchronized RGB + Depth — low-latency QoS so we drop old frames
+            // instead of queuing under load.
             subImage_ = std::make_shared<message_filters::Subscriber<sensor_msgs::msg::Image>>(
-                this, image_topic, rmw_qos_profile_default);
+                this, image_topic, qos_profile_image);
             subDepth_ = std::make_shared<message_filters::Subscriber<sensor_msgs::msg::Image>>(
-                this, depth_topic, rmw_qos_profile_default);
-            sync_ = std::make_shared<Sync>(SyncPolicy(10), *subImage_, *subDepth_);
+                this, depth_topic, qos_profile_image);
+            sync_ = std::make_shared<Sync>(SyncPolicy(5), *subImage_, *subDepth_);
             sync_->registerCallback(
                 std::bind(&AprilTagNode::rgbdCallback, this,
                     std::placeholders::_1, std::placeholders::_2));
@@ -508,15 +520,20 @@ private:
         std::string frame_id;
     };
 
-    FrameTransform lookupPublishingFrame(const std::string& camera_frame)
+    FrameTransform lookupPublishingFrame(
+        const std::string& camera_frame, const rclcpp::Time& stamp)
     {
         FrameTransform tf{false, Eigen::Quaterniond::Identity(), Eigen::Vector3d::Zero(), camera_frame};
         if (publishing_frame_.empty() || !tfBuffer_) return tf;
 
         try {
+            // Look up the transform at the image timestamp (not tf2::TimePointZero).
+            // Using TimePointZero takes the latest buffered TF, which drifts when
+            // the camera is moving and the TF stream has any latency relative to
+            // the image stream. `fromRclcpp` converts rclcpp::Time -> tf2::TimePoint.
             auto tfStamped = tfBuffer_->lookupTransform(
                 publishing_frame_, camera_frame,
-                tf2::TimePointZero,
+                tf2_ros::fromRclcpp(stamp),
                 tf2::durationFromSec(transform_timeout_));
             tf.rotation = Eigen::Quaterniond(
                 tfStamped.transform.rotation.w,
@@ -769,8 +786,8 @@ private:
         zarray_t* detections = apriltag_detector_detect(tagDetector_, &image);
         auto timeDetectionEnd = std::chrono::high_resolution_clock::now();
 
-        //Look up publishing frame transform
-        FrameTransform frameTf = lookupPublishingFrame(camera_frame);
+        //Look up publishing frame transform at the image timestamp
+        FrameTransform frameTf = lookupPublishingFrame(camera_frame, header.stamp);
         std::string pose_frame_id = frameTf.valid ? frameTf.frame_id : camera_frame;
 
         //Process each detected tag
@@ -1086,9 +1103,6 @@ private:
             return;
         }
 
-        int width = matColorGray.cols;
-        int height = matColorGray.rows;
-
         // Convert depth to float meters
         cv::Mat depthMeters;
         if (depthRaw.type() == CV_16UC1) {
@@ -1100,6 +1114,13 @@ private:
                 "Unsupported depth format: %d", depthRaw.type());
             return;
         }
+
+        // Clip the working size to the intersection of RGB and depth grids:
+        // aligned-depth-to-color streams can still have a smaller effective
+        // depth FOV (zero-depth borders or a smaller depth Mat outright), and
+        // collectTagPoints / getPoint would otherwise read past the depth Mat.
+        int width = std::min(matColorGray.cols, depthMeters.cols);
+        int height = std::min(matColorGray.rows, depthMeters.rows);
 
         cv::Mat matColorBGR;
         if (is_display_ || is_debug_) {
@@ -1116,8 +1137,13 @@ private:
         double cx = cameraInfo_->k[2];
         double cy = cameraInfo_->k[5];
 
-        // 3D point lookup using pinhole projection
+        // 3D point lookup using pinhole projection. Out-of-depth-grid pixels
+        // return z=0 so isValid below rejects them — matches the offline
+        // python detect_apriltags_per_frame_hdf5.py guard.
         auto getPoint = [&](int px, int py) -> Eigen::Vector3d {
+            if (px < 0 || py < 0 || px >= depthMeters.cols || py >= depthMeters.rows) {
+                return Eigen::Vector3d(0, 0, 0);
+            }
             float z = depthMeters.at<float>(py, px);
             double x = (px - cx) * z / fx;
             double y = (py - cy) * z / fy;
@@ -1183,9 +1209,12 @@ private:
         if (useParent) {
             geometry_msgs::msg::TransformStamped parentToCam;
             try {
+                // Same fix as in lookupPublishingFrame: use the image stamp
+                // (header.stamp) so the published TF matches the data it was
+                // computed from, instead of grabbing the latest buffered TF.
                 parentToCam = tfBuffer_->lookupTransform(
                     publishing_frame_, header.frame_id,
-                    tf2::TimePointZero,
+                    tf2_ros::fromRclcpp(rclcpp::Time(header.stamp)),
                     tf2::durationFromSec(transform_timeout_));
             } catch (const tf2::TransformException& ex) {
                 RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
