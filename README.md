@@ -1,43 +1,98 @@
-# Orbbec AprilTag ROS
+# AprilTag Pose
 
-This project utilizes the Orbbec Femto Bold RGB-D camera to detect 6D pose fiducial markers and publish them to ROS1:
-* Orbbec Femto Bolt Camera: https://www.orbbec.com/products/tof-camera/femto-bolt/
-* Orbbec SDK: https://github.com/orbbec/OrbbecSDK
+Detect AprilTag fiducial markers from any RGB-D source and publish their 6D poses via ROS 2. The node subscribes to an organized colored point cloud, making it compatible with any camera that publishes this standard ROS 2 topic (Orbbec, RealSense, ZED, Kinect, etc.).
+
 * AprilTags Library: https://april.eecs.umich.edu/software/apriltag
+* ROS 2 Humble on Ubuntu 22.04
 
-AprilTags detects the tag corners in the color image, and the point cloud is used to estimate the 3D position and orientation of the tag in the camera frame. Each detected tag's pose is published as a `geometry_msgs/PoseStamped` message in ROS1.
+AprilTags detects the tag corners in the color image extracted from the point cloud, and the organized point cloud is used to estimate the 3D position and orientation of the tag. Each detected tag's pose is published as a `geometry_msgs/msg/PoseStamped` message.
 
 ## Docker
 
-Build the Docker image using:
+Build the Docker image:
 ```
- ./build.sh
+./build.sh
 ```
-Open a terminal in the Docker container for debugging or development:
+Run the container:
 ```
-./launch_bash.sh
+./run.sh
 ```
-Start the publisher directly in the Docker container using:
+Inside the container, launch the node:
 ```
-./launch_publisher.sh [is_display] [is_verbose] [ros_master_ip] [this_node_ip]
+ros2 launch apriltag_pose apriltag_pose.launch.py
 ```
 
 ## Usage
 
 ```
-./inria_orbbec_tags [is_display, default=0] [is_verbose, default=0] [ros_master_ip, default=127.0.0.1] [this_node_ip, default=127.0.0.1]
+ros2 launch apriltag_pose apriltag_pose.launch.py display:=true verbose:=true
 ```
-`is_display`: Enables the visualization of the color and depth camera, as well as the detected tags (0 or 1).
-`is_verbose`: Enables printing additional information to the standard output (0 or 1).
-`ros_master_ip`: Defines the IP address for the ROS Master (string).
-`this_node_ip`: Assigns the IP address for this ROS node (string).
-Note that the ROS Master must be running externally.
+With a custom topic:
+```
+ros2 launch apriltag_pose apriltag_pose.launch.py cloud_topic:=/my_camera/depth/color/points
+```
+Publishing poses in a different frame:
+```
+ros2 launch apriltag_pose apriltag_pose.launch.py publishing_frame:=base_link publish_tf:=true
+```
 
-## ROS Topic
+## ROS 2 Parameters
 
-For each detected AprilTag marker, the publisher outputs a `geometry_msgs/PoseStamped` message as fast as possible, up to 30Hz, with the topic name `/inria_orbbec_tags/pose_tag_{TagID}`.
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `verbose` | bool | `false` | Enable verbose timing output |
+| `display` | bool | `false` | Enable OpenCV visualization of detected tags |
+| `cloud_topic` | string | `/camera/camera/depth/color/points` | Organized colored point cloud topic to subscribe to |
+| `publish_tf` | bool | `false` | Broadcast a TF frame for each detected tag |
+| `tag_frame_prefix` | string | `apriltag` | Prefix for per-tag TF child frames (e.g. `apriltag_0`, `apriltag_1`) |
+| `publishing_frame` | string | `""` | If set, transform poses from camera frame to this frame before publishing. If empty, publish in the point cloud's frame |
+| `transform_timeout` | double | `0.1` | Timeout in seconds for TF lookup when `publishing_frame` is set |
+| `filter_type` | string | `none` | Pose filter type: `none` or `median` |
+| `filter_window` | int | `5` | Filter window size (number of frames) |
+
+## ROS 2 Topics
+
+### Subscribed
+- `cloud_topic` (`sensor_msgs/msg/PointCloud2`): Organized colored point cloud
+
+### Published
+- `apriltag_pose/pose_tag_{id}` (`geometry_msgs/msg/PoseStamped`): Pose for each detected tag
+- `apriltag_pose/filtered_pose_tag_{id}` (`geometry_msgs/msg/PoseStamped`): Filtered pose (when `filter_type` is set)
+
+### TF Broadcasts (when `publish_tf:=true`)
+- `<publishing_frame or cloud_frame>` -> `<tag_frame_prefix>_{id}`
+
+## How It Works
+
+1. The node extracts a grayscale image from the point cloud's RGB data
+2. AprilTag detection runs on the grayscale image to find tag corners
+3. The 3D positions of the tag corners are looked up in the point cloud
+4. The tag's 6D pose (position + orientation) is computed in the camera frame
+5. If `publishing_frame` is set, the pose is transformed to that frame via TF
+6. The pose is published; if `publish_tf` is enabled, the TF is broadcast
+
+## Requirements
+
+The point cloud must be:
+- **Organized**: `height > 1`, with dimensions matching the color image
+- **Colored**: Must contain an `rgb` field
+- **Aligned**: Depth-to-color registered so that pixel (x, y) in the image corresponds to the point at (x, y) in the point cloud
+
+Most RGB-D camera ROS 2 drivers provide an aligned/registered colored point cloud topic (e.g. `camera/depth/color/points`).
+
+## Building in an Existing Workspace
+
+To add this package to an existing ROS 2 workspace:
+```bash
+cd /ros2_ws/src
+cp -r /path/to/apriltag_pose .
+cd /ros2_ws
+colcon build --packages-select apriltag_pose
+source install/setup.bash
+```
+
+Note: The AprilTag library must be built at `/opt/apriltag` (see Dockerfile for reference).
 
 ## License
 
 Licensed under the [BSD License](LICENSE)
-

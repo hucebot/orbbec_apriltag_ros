@@ -1,0 +1,48 @@
+# apriltag_pose - AprilTag Detection (ROS Jazzy + CUDA)
+# Standalone: docker compose up
+# Combined:  included from ~/docker-compose.yml
+
+services:
+  apriltag_pose:
+    image: inria_docker:april_tag_jazzy_03.26
+    container_name: apriltag_pose
+    stdin_open: true
+    tty: true
+    network_mode: host
+    ipc: host
+    environment:
+      - DISPLAY=${DISPLAY:-:0}
+      - QT_X11_NO_MITSHM=1
+      - XAUTHORITY=${XAUTHORITY}
+      - XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - ROS_DOMAIN_ID=1
+      - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+      - CYCLONEDDS_URI=file:///cyclonedds.xml
+      - APRILTAG_VERBOSE=${APRILTAG_VERBOSE:-true}
+      - APRILTAG_DEBUG=${APRILTAG_DEBUG:-true}
+      - APRILTAG_PUBLISHING_FRAME=${APRILTAG_PUBLISHING_FRAME:-}
+      - ENABLE_APRILTAG_TO_BOX=${ENABLE_APRILTAG_TO_BOX:-false}
+      - APRILTAG_TO_BOX_TAG_ID=${APRILTAG_TO_BOX_TAG_ID:-23}
+      - BOX_POSE_TOPIC=${BOX_POSE_TOPIC:-/g1pilot/box_pose}
+      - BOX_PUBLISHING_FRAME=${BOX_PUBLISHING_FRAME:-}
+      - BOX_EXTENTS=${BOX_EXTENTS:-0.02,0.0,1.09,0.30,0.25,0.56}
+      - APRILTAG_FIX_AXIS=${APRILTAG_FIX_AXIS:-}
+      - APRILTAG_POSE_MODE=${APRILTAG_POSE_MODE:-}
+      - APRILTAG_TAG_SIZE=${APRILTAG_TAG_SIZE:-}
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - /dev/shm:/dev/shm
+      - ./apriltag_pose:/ros2_ws/src/apriltag_pose:ro
+      - ./entrypoint.sh:/entrypoint.sh:ro
+      - ./docker/cyclonedds.xml:/cyclonedds.xml:ro
+    devices:
+      - /dev/dri:/dev/dri
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    entrypoint: ["/bin/bash", "/entrypoint.sh"]
