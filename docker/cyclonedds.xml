@@ -6,5 +6,8 @@
       <!-- To force a specific interface: <NetworkInterfaceAddress>eno2</NetworkInterfaceAddress> -->
       <AllowMulticast>default</AllowMulticast>
     </General>
+    <Discovery>
+      <MaxAutoParticipantIndex>50</MaxAutoParticipantIndex>
+    </Discovery>
   </Domain>
 </CycloneDDS>
