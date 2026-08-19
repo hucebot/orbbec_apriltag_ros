@@ -1,33 +1,28 @@
 <CycloneDDS>
-  <Domain>
-    <General>
-      <AllowMulticast>false</AllowMulticast>
-      <MaxMessageSize>1400B</MaxMessageSize>
-      <Interfaces>
-        <NetworkInterface name="enx607d09178f25" priority="1"/>
-        <NetworkInterface name="lo" priority="0"/>
-      </Interfaces>
-    </General>
-    <Discovery>
-      <ParticipantIndex>auto</ParticipantIndex>
-      <Peers>
-        <Peer Address="localhost"/>
-        <Peer Address="10.68.0.209"/>
-        <Peer Address="10.68.0.210"/>
-        <Peer Address="10.68.0.208"/>
-        <Peer Address="10.68.0.142"/>
-        <Peer Address="10.68.0.206"/>
-      </Peers>
-      <MaxAutoParticipantIndex>500</MaxAutoParticipantIndex>
-    </Discovery>
-    <Internal>
-      <Watermarks>
-        <WhcHigh>2000kB</WhcHigh>
-      </Watermarks>
-    </Internal>
-    <Tracing>
-      <Verbosity>config</Verbosity>
-      <OutputFile>${HOME}/.ros/log/cdds.log</OutputFile>
-    </Tracing>
-  </Domain>
+    <Domain>
+        <General>
+            <Interfaces>
+                <NetworkInterface name="enp0s31f6" priority="1" />
+            </Interfaces>
+            <MaxMessageSize>1400B</MaxMessageSize>
+            <AllowMulticast>false</AllowMulticast>
+        </General>
+        <Discovery>
+            <ParticipantIndex>auto</ParticipantIndex>
+            <Peers>
+                <Peer address="10.68.0.1" />
+                <Peer address="localhost" />
+            </Peers>
+            <MaxAutoParticipantIndex>50</MaxAutoParticipantIndex>
+        </Discovery>
+        <Internal>
+            <Watermarks>
+                <WhcHigh>2000kB</WhcHigh>
+            </Watermarks>
+        </Internal>
+        <Tracing>
+            <Verbosity>config</Verbosity>
+            <OutputFile>${HOME}/.ros/log/cdds.log</OutputFile>
+        </Tracing>
+    </Domain>
 </CycloneDDS>
