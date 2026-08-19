@@ -2,7 +2,8 @@
     <Domain>
         <General>
             <Interfaces>
-                <NetworkInterface name="enp0s31f6" priority="1" />
+                <NetworkInterface name="lo" priority="1" />
+                <NetworkInterface name="enp0s31f6" priority="2" />
             </Interfaces>
             <MaxMessageSize>1400B</MaxMessageSize>
             <AllowMulticast>false</AllowMulticast>
@@ -12,8 +13,9 @@
             <Peers>
                 <Peer address="10.68.0.1" />
                 <Peer address="localhost" />
+                <Peer address="10.68.0.208" />
             </Peers>
-            <MaxAutoParticipantIndex>50</MaxAutoParticipantIndex>
+            <MaxAutoParticipantIndex>99</MaxAutoParticipantIndex>
         </Discovery>
         <Internal>
             <Watermarks>
@@ -24,5 +26,9 @@
             <Verbosity>config</Verbosity>
             <OutputFile>${HOME}/.ros/log/cdds.log</OutputFile>
         </Tracing>
+        <SharedMemory>
+            <Enable>true</Enable>
+            <LogLevel>info</LogLevel>
+        </SharedMemory>
     </Domain>
 </CycloneDDS>

@@ -21,7 +21,9 @@ RUN apt-get update && apt-get install -y --fix-missing \
     software-properties-common mesa-utils mesa-va-drivers vainfo \
     python3-pip python3-numpy libeigen3-dev \
     libv4l-dev v4l-utils wget curl libnuma-dev libnuma1 libgles-dev \
-    libglvnd-dev libgl1-mesa-dev libglu1-mesa-dev
+    libglvnd-dev libgl1-mesa-dev libglu1-mesa-dev \
+    udev \
+    usbutils
 
 #Install ROS 2 humble
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates gnupg && \
@@ -35,9 +37,9 @@ RUN ROS_APT_SOURCE_VERSION="$(curl -fsSL https://api.github.com/repos/ros-infras
     rm -f /tmp/ros2-apt-source.deb
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ros-${ROS_DISTRO}-desktop-full \
-    ros-dev-tools \
-    && \
-    rm -rf /var/lib/apt/lists/*
+    ros-dev-tools
+    # && \
+    # rm -rf /var/lib/apt/lists/*
 
 #Install CycloneDDS
 RUN apt-get update && apt-get install -y ros-${ROS_DISTRO}-rmw-cyclonedds-cpp
@@ -52,8 +54,10 @@ RUN apt-get update && apt-get install -y \
     ros-${ROS_DISTRO}-std-msgs \
     ros-${ROS_DISTRO}-tf2-geometry-msgs \
     ros-${ROS_DISTRO}-tf2 \
-    ros-${ROS_DISTRO}-tf2-ros
-
+    ros-${ROS_DISTRO}-tf2-ros \
+    ros-${ROS_DISTRO}-image-transport-plugins \
+    ros-humble-librealsense2* \
+    ros-humble-realsense2-*
 #Install OpenCV
 RUN apt-get update && apt-get install -y libopencv-dev libopencv-core-dev opencv-data
 

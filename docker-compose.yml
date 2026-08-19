@@ -9,7 +9,9 @@ services:
     stdin_open: true
     tty: true
     network_mode: host
+    privileged: true
     ipc: host
+    pid: host
     environment:
       - DISPLAY=${DISPLAY:-:0}
       - QT_X11_NO_MITSHM=1
@@ -20,7 +22,7 @@ services:
       - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
       - CYCLONEDDS_URI=file:///cyclonedds.xml
       - APRILTAG_VERBOSE=${APRILTAG_VERBOSE:-true}
-      - APRILTAG_DEBUG=${APRILTAG_DEBUG:-true}
+      - APRILTAG_DEBUG=${APRILTAG_DEBUG:-false}
       - APRILTAG_PUBLISHING_FRAME=${APRILTAG_PUBLISHING_FRAME:-head_front_camera_link}
       - ENABLE_APRILTAG_TO_BOX=${ENABLE_APRILTAG_TO_BOX:-false}
       - APRILTAG_TO_BOX_TAG_ID=${APRILTAG_TO_BOX_TAG_ID:-23}
@@ -40,6 +42,9 @@ services:
       - ./apriltag_pose:/ros2_ws/src/apriltag_pose:ro
       - ./entrypoint.sh:/entrypoint.sh:ro
       - ./docker/cyclonedds.xml:/cyclonedds.xml:ro
+      - /dev/bus/usb:/dev/bus/usb
+      - ./launch_realsense.sh:/workspace/launch_realsense.sh
+    
     devices:
       - /dev/dri:/dev/dri
     deploy:
@@ -49,5 +54,45 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
-    entrypoint: ["/bin/bash", "/entrypoint.sh"]
-    command: ["ros2", "launch", "apriltag_pose", "aprlitag_tiago_pro.py"]
+    entrypoint:   ["/bin/bash", "/entrypoint.sh"]
+    # command: ["ros2", "launch", "apriltag_pose", "aprlitag_tiago_pro.py"]
+    command: >
+      bash -c "
+        bash /workspace/launch_realsense.sh realsense_head_front & 
+        ros2 launch apriltag_pose aprlitag_tiago_pro.py"
+
+      
+    # bash -c "
+    #   bash /workspace/launch_realsense.sh realsense_head_front & 
+    #   ros2 launch apriltag_pose aprlitag_ti
+    # working_dir: /workspace
+    # command: >
+    #   bash -c "chmod +x launch_realsense.sh &&
+    #   source /opt/ros/humble/setup.bash &&
+    #   ./launch_realsense.sh realsense_head_front &&
+      # ros2 launch apriltag_pose aprlitag_tiago_pro"
+
+
+  # realsense:
+  #   image: inria_docker:april_tag_humble
+  #   container_name: realsense_node_orbbec
+  #   network_mode: host
+  #   privileged: true
+  #   pid: host
+  #   environment:
+  #     - ROS_DOMAIN_ID=2
+  #     - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+  #     - CYCLONEDDS_URI=file:///cyclonedds.xml
+  #   volumes:
+  #     - /tmp/.X11-unix:/tmp/.X11-unix:rw
+  #     - /dev/shm:/dev/shm
+  #     - ./entrypoint.sh:/entrypoint.sh:ro
+  #     - ./docker/cyclonedds.xml:/cyclonedds.xml:ro
+  #     - /dev/bus/usb:/dev/bus/usb
+  #     - ./launch_realsense.sh:/workspace/launch_realsense.sh
+  #   working_dir: /workspace
+  #   # Ensure script is executable and run it
+  #   command: >
+  #     bash -c "chmod +x launch_realsense.sh &&
+  #     source /opt/ros/humble/setup.bash &&
+  #     ./launch_realsense.sh realsense_head_front"

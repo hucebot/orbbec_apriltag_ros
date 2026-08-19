@@ -7,13 +7,17 @@ source /opt/ros/${ROS_DISTRO:-humble}/setup.bash
 
 cd /ros2_ws
 
+echo "=== Starting RouDi ==="
+iox-roudi &
+ROUDI_PID=$!
+
 echo "=== Building apriltag_pose ==="
 colcon build --packages-select apriltag_pose
 source /ros2_ws/install/setup.bash
 
 echo "=== Launching apriltag_pose ==="
 LAUNCH_ARGS="verbose:=${APRILTAG_VERBOSE:-true}"
-LAUNCH_ARGS="${LAUNCH_ARGS} debug:=${APRILTAG_DEBUG:-true}"
+LAUNCH_ARGS="${LAUNCH_ARGS} debug:=${APRILTAG_DEBUG:-false}"
 LAUNCH_ARGS="${LAUNCH_ARGS} enable_apriltag_to_box:=${ENABLE_APRILTAG_TO_BOX:-false}"
 LAUNCH_ARGS="${LAUNCH_ARGS} apriltag_to_box_tag_id:=${APRILTAG_TO_BOX_TAG_ID:-23}"
 LAUNCH_ARGS="${LAUNCH_ARGS} box_pose_topic:=${BOX_POSE_TOPIC:-/g1pilot/box_pose}"
